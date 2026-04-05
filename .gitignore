@@ -1,9 +1,9 @@
-# Inputs — owned by third parties, live in the parent directory
-# (Out-of-repo by layout, but listed here as a safety rail.)
-*.bin
-at32f403a_lib/
-FreeRTOS/
-vendor/
+# Test target binaries — built locally, referenced by config.yaml,
+# not committed. Keep the README and .gitkeep visible so the directory
+# structure survives a fresh clone.
+targets/*
+!targets/README.md
+!targets/.gitkeep
 
 # Pipeline outputs — always regeneratable from inputs
 build/
@@ -47,6 +47,9 @@ __pycache__/
 venv/
 env/
 .python-version
+
+# Snakemake
+.snakemake/
 
 # Environment and secrets
 .env

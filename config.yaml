@@ -1,0 +1,32 @@
+# ripcord pipeline configuration
+#
+# Targets to analyze. Each entry is a short name mapped to the ELF path
+# (absolute or relative to the repo root) and an optional description.
+# Paths typically live under targets/<name>/, which is gitignored.
+#
+# To add a new target: build the ELF somewhere, drop it under
+# targets/<name>/, and add an entry here. No Snakemake rules need to change.
+
+targets:
+  pico_blinky:
+    elf: targets/pico_blinky/blink.elf
+    description: "Raspberry Pi Pico SDK blinky example, Cortex-M0+, bare metal"
+    arch: arm
+    source: "pico-sdk/src/rp2_common/pico_blink"
+
+  # Uncomment and add entries as you build more targets.
+  #
+  # pico_freertos_blinky:
+  #   elf: targets/pico_freertos_blinky/blink_freertos.elf
+  #   description: "Pico SDK + FreeRTOS blinky"
+  #   arch: arm
+  #
+  # zephyr_hello_world:
+  #   elf: targets/zephyr_hello_world/zephyr.elf
+  #   description: "Zephyr hello_world sample on qemu_cortex_m3"
+  #   arch: arm
+  #
+  # arduino_uno_blink:
+  #   elf: targets/arduino_uno_blink/Blink.ino.elf
+  #   description: "Arduino Uno blink sketch, ATmega328P"
+  #   arch: avr

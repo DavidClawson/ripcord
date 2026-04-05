@@ -2,50 +2,75 @@
 
 ## The reframe
 
-The natural first framing of this project is "reverse-engineer the firmware
-into a clean readable codebase." That framing is wrong for the actual goal,
-and realizing it is wrong unlocks a better pipeline.
+The natural first framing of firmware reverse engineering is
+"reverse-engineer the binary into a clean readable codebase." That
+framing is usually wrong, and realizing it is wrong unlocks a better
+pipeline.
 
-The actual goal is: **write replacement firmware that drives the existing
-hardware faithfully.** The hardware is an MCU (AT32F403A) plus an opaque
-FPGA. The FPGA's internal logic is permanently unknowable — it isn't going
-to be decompiled. The only observable surface of the FPGA is the sequence of
-MMIO reads and writes the MCU performs against it, plus any timing
+For most real-world reverse engineering goals — writing replacement
+firmware, verifying hardware behavior, extracting a protocol
+specification, characterizing an opaque peripheral — **understanding
+every function's "purpose" is nice but not necessary**. What's
+necessary is a structured, queryable specification of the binary's
+observable behavior: its call graph, its data flow, its hardware
+interactions, and the semantic contract of each function.
+
+If you have that specification, you can answer every question a human
+could answer by reading the binary, without ever asking a human to
+read the binary. And critically, most of that specification can be
+*extracted mechanically* by existing tools — Ghidra for static
+analysis, Renode for dynamic traces, angr for symbolic facts — without
+requiring any LLM involvement at all.
+
+## The hardware-boundary case — an illustrative extreme
+
+The most demanding version of this problem is firmware that drives an
+opaque hardware peripheral (FPGA, ASIC, external coprocessor) whose
+internal behavior cannot be recovered by any means. In that case, the
+only observable surface of the peripheral is the sequence of MMIO
+reads and writes the MCU performs against it, plus any timing
 assumptions baked into the MCU code.
 
-This means: understanding every function's "purpose" is nice but not
-necessary. **What's necessary is a complete specification of the MCU↔FPGA
-boundary** — every register, every access pattern, every sequence, every
-timing constraint. If we can reproduce that boundary behavior exactly,
-replacement firmware works, regardless of how much of the rest of the MCU
-code we've truly "understood."
+For that case, the observation that shapes the whole pipeline is: **the
+firmware, by construction, already contains a complete executable
+specification of the peripheral's interface**. The MCU cannot drive
+the peripheral without encoding the full protocol. Everything needed
+is in there; the problem is bounded.
 
-## The optimistic corollary
+This is the most hopeful framing available: we are not trying to
+discover hidden information, we are trying to *extract* information
+that provably exists in the binary. And the pipeline design is shaped
+by the demands of this extreme — if it handles the opaque-peripheral
+case, it handles everything simpler.
 
-The firmware, by construction, already contains a complete executable
-specification of the FPGA's interface. The MCU cannot drive the FPGA without
-encoding the full protocol. Everything needed is in there; it's bounded.
-This is the most hopeful framing of the whole project: we are not trying to
-discover hidden information, we are trying to *extract* information that
-provably exists in the binary.
+This hardware-boundary framing was sharpened on a specific project
+(the "cord" target — an AT32F403A driving an opaque FPGA over the
+EXMC/FSMC bus) but applies to any firmware with external hardware
+dependencies whose documentation is missing or incomplete.
 
 ## What the output artifact should be
 
 Given the reframe, the output artifact is **not source code**. It is a
-**queryable specification** of:
+**queryable database** of:
 
-- The FPGA register map (addresses, widths, inferred roles)
-- Access patterns per register (read-only, write-only, command/status pairs,
-  polling loops, FIFO-like regions)
-- Per-feature MMIO traces (the register sequence observed when the user
-  presses a button, refreshes the LCD, sends a USB packet, etc.)
-- Timing constraints observed in the original firmware
-- Boundary APIs where the MCU calls into FreeRTOS or the AT32 SDK (these
-  should be identified as known code and used as typed interfaces)
+- Functions (addresses, sizes, signatures, inferred roles, library
+  identifications)
+- Basic blocks and control flow graphs
+- Call graph edges
+- Memory access patterns, including the MMIO register map and access
+  histories for any peripheral regions
+- Per-feature execution traces (the observable behavior when the
+  device does specific things, captured via emulation)
+- Boundary APIs where the binary calls into known libraries
+  (FreeRTOS, vendor HALs, crypto libraries, protocol stacks),
+  identified by structural fingerprinting
+- Semantic contracts for application-specific functions, produced
+  jointly by static analysis, symbolic execution, and verified
+  LLM-agent proposals
 
-Source code — in C, Rust, or whatever — is a *render* of that spec that
-happens later, after you have the spec, and gets verified by differential
-testing.
+Source code — in C, Rust, or whatever — is a *render* of that database
+that happens later, after you have the database, and gets verified by
+differential testing against the original.
 
 ## Why Rust was the wrong lift target
 
@@ -67,40 +92,44 @@ What actually catches logic bugs:
    inputs in Unicorn; compare register and memory deltas. This is the only
    check that catches "I wrote 0x5B instead of 0x5A."
 2. **Symbolic execution via angr.** Derive formal facts like "this function
-   writes 0x5A to reg 0x14 iff arg0 > 0 and g_mode == 2."
+   writes a specific value to a specific register iff some precondition
+   holds."
 3. **Per-feature MMIO trace equivalence.** Compare Renode traces of the
    original against traces of the replacement running the same scenarios.
 
 None of these are language features. They are execution-based verification.
 
-## Three lift-target options (ranked for this project)
+## Three lift-target options
 
-### Option A — No target language; the spec database is the artifact
+### Option A — No target language; the database is the artifact
 
-The deliverable is the SQLite/DuckDB database itself, enriched over time
-with facts, traces, and derived queries. You never produce a clean codebase
-as an intermediate. Instead:
+The deliverable is the DuckDB warehouse (plus SQLite coordination
+layer) itself, enriched over time with facts, traces, and derived
+queries. You never produce a clean codebase as an intermediate.
+Instead:
 
 - Each function has a row with its contract (signature, reads/writes,
   side effects, confidence).
-- Each FPGA register has a row with its inferred role and access history.
-- Each high-level feature has a row pointing at the MMIO trace that
-  realizes it.
-- Replacement firmware is written fresh against the database, in whatever
-  language makes sense for the target (probably C because of the vendor
-  SDK).
+- Each peripheral register (for targets with external hardware) has
+  a row with its inferred role and access history.
+- Each high-level observable behavior has a row pointing at the trace
+  that realizes it.
+- Replacement firmware, if it is ever written, is written fresh
+  against the database in whatever language makes sense for the
+  target.
 
-**Strongest fit for the stated goal.** The database answers replication
-questions directly. Comprehension happens as a side effect.
+**Strongest fit for most goals.** The database answers comprehension
+and replication questions directly. Source code, if desired, comes
+later.
 
 ### Option B — C as the lift target
 
 Not because C is safer (it obviously isn't) but because it is the native
 dialect of firmware. Bit twiddling, volatile MMIO, packed structs, inline
 asm — all ergonomic. clangd provides cross-references and refactoring.
-UBSan/ASan catch a lot under emulation. The AT32 SDK is already C, so
-integration is free. Reasonable secondary option if you want source code to
-exist alongside the spec DB.
+UBSan/ASan catch a lot under emulation. Vendor SDKs are almost always
+C, so integration is free. Reasonable secondary option if you want
+source code to exist alongside the database.
 
 ### Option C — Datalog DSL as the derivation layer
 
@@ -113,14 +142,15 @@ Datalog (via Soufflé) expresses recursive relationships compactly:
 These queries are miserable in SQL and natural in Datalog. Not an
 alternative to Option A — a *layer on top of it*.
 
-## Ranking for this project
+## Ranking
 
 **A → C (on top of A) → B → Rust.**
 
-The structured spec is the deliverable; Datalog is the derivation engine on
-top; C is useful if you want a rendered source tree alongside the spec;
-Rust is the weakest fit because its safety guarantees don't catch the
-bugs you actually care about, and its type system fights firmware idioms.
+The structured database is the deliverable; Datalog is the derivation
+engine on top; C is useful if you want a rendered source tree
+alongside the database; Rust is the weakest fit because its safety
+guarantees don't catch the bugs you actually care about, and its type
+system fights firmware idioms.
 
 ## The key verification loop
 

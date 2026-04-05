@@ -42,33 +42,43 @@ tables with zero analysis applied.
 
 ### Stage 1 — Library identification
 
-- Compile FreeRTOS (already in this repo) and the AT32 SDK with the likely
-  toolchain flags (`arm-none-eabi-gcc -mcpu=cortex-m4 -Os` or similar).
-- Extract function-level signatures (byte patterns, basic-block hashes,
-  structural features).
-- Match against functions in the firmware binary.
-- Mark matched functions with their real names, signatures, and behavior
-  from source. Tag confidence.
+- Compile candidate libraries — FreeRTOS, Zephyr, vendor HALs (ST,
+  Nordic, Artery, NXP, Silabs, TI), common libraries (lwIP, mbedTLS,
+  FatFS, LittleFS, tinyusb) — with appropriate toolchain flags for
+  the target architecture (`arm-none-eabi-gcc -mcpu=cortex-m4 -Os`,
+  plus variations across GCC versions and optimization levels).
+- Extract function-level signatures (byte patterns, basic-block
+  hashes, structural features, constant sets).
+- Match against functions in the target binary.
+- Mark matched functions with their real names, signatures, and
+  behavior from source. Tag confidence.
 
-This step alone probably resolves 50–80% of the binary without any LLMs
-involved, and gives every remaining unknown function *typed boundaries* at
-its call edges.
+This step alone typically resolves 50–80% of a well-behaved embedded
+binary without any LLMs involved, and gives every remaining unknown
+function *typed boundaries* at its call edges.
 
 Output: `functions.inferred_name`, `functions.contract_json`,
 `functions.confidence` populated for matched functions.
 
 ### Stage 2 — Dynamic trace capture with Renode
 
-- Port an STM32F4 Renode platform file (`.repl`) to AT32F403A. Patch for the
-  known AT32-vs-STM divergences discovered during manual RE. Version the
-  platform file alongside the pipeline code.
-- Add a custom `BusPeripheral` model for the FPGA address range (EXMC/FSMC
-  bank) that logs every access with full context: PC, cycle count, address,
-  value, direction.
-- Write one scenario script per feature exercised: power-on, idle, each
-  button press, each USB event, LCD refresh, etc.
-- Run each scenario; capture the MMIO trace; ingest into the `mmio_events`
-  table tagged with `scenario_id` and `platform_version`.
+- Select (or build) a Renode platform file (`.repl`) matching the
+  target's chip. Most common Cortex-M targets already have usable
+  platforms in the Renode repo; unusual targets need a custom one
+  derived from the closest relative. Any chip-specific quirks
+  discovered during analysis are documented in the platform file and
+  versioned alongside the pipeline.
+- Enable bus logging across all memory regions of interest. For
+  targets with external peripherals, add a custom `BusPeripheral`
+  model for each peripheral's address range that logs every access
+  with full context: PC, cycle count, address, value, direction.
+- Write one scenario script per observable behavior: power-on, idle,
+  each user-facing action, each external event. Each scenario is a
+  Renode script that boots the firmware, exercises one behavior, and
+  records what happens.
+- Run each scenario; capture the MMIO trace; ingest into the
+  `mmio_events` table tagged with `scenario_id` and
+  `platform_version`.
 
 Output: ground-truth traces that anchor the rest of the pipeline.
 
@@ -76,14 +86,18 @@ Output: ground-truth traces that anchor the rest of the pipeline.
 
 Pure computation over traces and the function database:
 
-- Cluster register accesses by address to discover FPGA registers.
+- Cluster memory accesses by address to discover the peripheral
+  register map.
 - Infer register widths from access sizes.
-- Classify registers: read-only, write-only, polled (read-in-loop), FIFO-like
-  (sequential writes to same address), command/status pairs.
-- Correlate each MMIO event with the function that issued it via recorded PC.
-- Populate `fpga_registers`, `register_accesses`, `feature_traces`.
+- Classify registers: read-only, write-only, polled (read-in-loop),
+  FIFO-like (sequential writes to same address), command/status
+  pairs.
+- Correlate each MMIO event with the function that issued it via
+  recorded PC.
+- Populate `registers`, `register_accesses`, `feature_traces`.
 
-Output: a first-draft register map, automatically derived.
+Output: a first-draft register map, automatically derived from
+observed behavior.
 
 ### Stage 4 — Derivation layer (Datalog/Soufflé)
 
@@ -181,7 +195,7 @@ basic_blocks(id, function_id, addr, size, pcode_blob)
 
 calls(caller_id, callee_id, call_site_addr)
 
-fpga_registers(addr, inferred_name, width, access_type, confidence,
+registers(addr, inferred_name, width, access_type, confidence,
                first_observed_scenario)
 
 register_accesses(id, function_id, basic_block_id, register_addr,

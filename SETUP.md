@@ -1,60 +1,132 @@
 # Setup
 
-ripcord expects certain inputs to exist alongside the repository. None
-of them are tracked in git — they are either vendor-owned, large
-build outputs, or regeneratable artifacts.
+Tooling and environment prerequisites for running the ripcord
+pipeline. Nothing here is target-specific; ripcord works on any ELF
+binary it is pointed at via `config.yaml`.
 
-## Expected layout
+## Required tools
 
-The repository is designed to live at `cord/ripcord/` with its inputs
-in the parent `cord/` directory:
+### Ghidra
 
+Latest stable release, running on your local machine. Installed via
+Homebrew (`brew install --cask ghidra`) or downloaded from
+https://ghidra-sre.org/. The pipeline invokes `analyzeHeadless`, which
+ships with every Ghidra install under `<ghidra_root>/support/`.
+
+If `analyzeHeadless` is not on your `$PATH`, export its location
+before running the pipeline:
+
+```bash
+export GHIDRA_HEADLESS=/Applications/ghidra_11.3_PUBLIC/support/analyzeHeadless
 ```
-cord/
-├── APP_2C53T_V1.2.0_251015.bin    # firmware under analysis
-├── at32f403a_lib/                  # ArteryTek AT32F403A SDK
-├── FreeRTOS/                       # FreeRTOS source tree (MIT)
-├── Update Log.txt                  # vendor changelog
-└── ripcord/                        # this repository
+
+(Replace the path with whichever version you have installed.) The
+Snakefile picks up this variable.
+
+### Ghidrathon
+
+[Mandiant's Ghidrathon extension](https://github.com/mandiant/Ghidrathon)
+replaces Ghidra's bundled Jython 2 with modern CPython 3, which makes
+extraction scripts sane to write and lets them share a Python
+environment with the rest of the pipeline.
+
+1. Check your Ghidra version (`Help → About Ghidra`).
+2. Download the Ghidrathon release matching that Ghidra version from
+   https://github.com/mandiant/Ghidrathon/releases.
+3. In Ghidra, go to `File → Install Extensions` and install the
+   downloaded `.zip`.
+4. Restart Ghidra.
+5. In Ghidra's Script Manager, configure the Python interpreter path
+   to point at the same Python you use for the rest of the pipeline
+   (see next section).
+
+### Python 3.11+
+
+Any modern Python will do. The pipeline uses the following packages:
+
+```bash
+pip install 'duckdb>=0.10' pyarrow polars snakemake
 ```
 
-Nothing inside `ripcord/` references these paths with absolute paths —
-pipeline scripts resolve them relative to the repo root (`../`). When
-the pipeline code starts to exist, any required path configuration
-will be declared in a single place (likely the Snakemake config or an
-`.env`-style file that is itself gitignored).
+Those same packages need to be available to Ghidrathon (so extraction
+scripts can write Parquet or JSON if they need to). The cleanest
+setup is a single virtualenv used both by Ghidrathon and by Snakemake:
 
-## Fresh checkout instructions
+```bash
+python3 -m venv ~/.venvs/ripcord
+source ~/.venvs/ripcord/bin/activate
+pip install 'duckdb>=0.10' pyarrow polars snakemake
+```
 
-If you are setting up a new machine or a new clone:
+Then point Ghidrathon at `~/.venvs/ripcord/bin/python` during its
+configuration step.
 
-1. Clone this repository somewhere convenient.
-2. Place the firmware binary at `../APP_2C53T_V1.2.0_251015.bin`
-   relative to the repo root, or update your local config to point at
-   its actual path.
-3. Obtain the AT32F403A SDK from ArteryTek's developer portal and
-   extract it to `../at32f403a_lib/`.
-4. Clone FreeRTOS from https://github.com/FreeRTOS/FreeRTOS to
-   `../FreeRTOS/`.
+### DuckDB CLI (optional but recommended)
 
-## Ownership note
+For interactive queries against the warehouse outside of Python:
 
-The firmware binary is the original vendor's intellectual property and
-is not included in this repository. All analysis work captured in this
-repository is the repository author's own work product.
+```bash
+brew install duckdb
+```
 
-## Toolchain prerequisites
+The Python bindings above are sufficient for the pipeline itself;
+the CLI is just for exploration.
 
-None installed yet — these will be documented here as they are added
-during Phase 0 bootstrapping (see `notes/PLAN.md`). Expected list:
+### Snakemake
 
-- **Python 3.11+** with `duckdb`, `pyarrow`, `polars`, `snakemake`,
-  `unicorn`, eventually `angr`
-- **Ghidra** (latest stable) with **Ghidrathon** for Python 3 scripting
-- **Renode** (you already have it from another project)
-- **Soufflé** (Datalog engine) — later, for the derivation layer
-- **arm-none-eabi-gcc** toolchain — for compiling FreeRTOS and the
-  AT32 SDK for library identification
+Installed as part of the Python packages above. Verify:
 
-When Phase 0 actually starts, this file will grow a versioned
-dependency manifest and installation instructions.
+```bash
+snakemake --version
+```
+
+## Optional tools (added in later phases)
+
+- **arm-none-eabi-gcc** — ARM toolchain for building test targets
+  from source. Required for the Pico SDK, Zephyr, and FreeRTOS test
+  targets. Install via `brew install --cask gcc-arm-embedded`.
+- **Raspberry Pi Pico SDK** — the first test target builds against
+  this. Clone from https://github.com/raspberrypi/pico-sdk to a
+  convenient location and export `PICO_SDK_PATH`. See
+  [`targets/README.md`](./targets/README.md).
+- **Renode** — full-system emulator for hardware trace capture.
+  Added in a later pipeline phase. Install from
+  https://renode.io/.
+- **Unicorn Engine** — per-function differential testing. Added in a
+  later phase. `pip install unicorn`.
+- **angr** — targeted symbolic execution for hard functions. Later
+  phase. `pip install angr`.
+- **Soufflé** — Datalog engine for the fact derivation layer. Later
+  phase.
+
+## Verifying the environment
+
+Once Ghidra and the Python environment are set up:
+
+```bash
+# Ghidra headless
+analyzeHeadless --help 2>&1 | head -3
+#   (or: $GHIDRA_HEADLESS --help)
+
+# Python environment
+python -c "import duckdb, pyarrow, snakemake; print('python ok')"
+
+# Snakemake
+snakemake --version
+```
+
+All three should return without error. You are then ready to build a
+test target and run the pipeline.
+
+## Building a first test target
+
+See [`targets/README.md`](./targets/README.md) for instructions on
+building the Pico SDK blinky example and wiring it into the pipeline
+via `config.yaml`.
+
+## No firmware binary is required
+
+ripcord has no built-in assumption about any specific target binary.
+Targets are listed in `config.yaml` and built separately. The
+repository ships with no firmware and requires none to run — point
+the pipeline at any ELF you want to analyze.

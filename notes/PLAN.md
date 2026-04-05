@@ -6,124 +6,168 @@ practice.
 
 ## Phase 0 — Bootstrapping (days, not weeks)
 
-**Goal:** minimal viable pipeline skeleton that the rest can grow into.
-No LLMs, no agents, no Datalog. Just extract, store, and query.
+**Goal:** minimal viable pipeline skeleton that the rest can grow
+into. No LLMs, no agents, no Datalog. Just extract, store, and query.
+
+**First test target: Raspberry Pi Pico SDK blinky.** Cortex-M0+, bare
+metal, single peripheral (the LED GPIO), full DWARF ground truth,
+trivially easy to build on any Mac or Linux machine. This is
+target-of-opportunity #1 — validation against it proves the pipeline
+works end-to-end against a known-good binary before anything harder
+is attempted.
 
 ### 0.1 Repo structure
 
-- Create a dedicated pipeline repo or subdirectory alongside this one.
-  Keep the firmware `.bin` as an input, not a mutable artifact.
-- Version everything together: Ghidra scripts, Renode platform file,
-  Snakemake rules, schema migrations, Python tools.
-- Set up a `build/` directory as the Snakemake output root. Treat it as
-  fully regeneratable — nothing in `build/` is manually edited.
+- The ripcord repository lives at `~/Desktop/ripcord/` (or wherever
+  it was cloned). It is self-contained and has no external input
+  requirements.
+- Version everything together: Ghidra scripts, Snakemake rules,
+  schema migrations, Python tools, config files.
+- `build/` is the Snakemake output root. Treat it as fully
+  regeneratable — nothing in `build/` is manually edited.
+- `targets/` is where test binaries live (gitignored). Each target
+  gets its own subdirectory with the ELF and optional metadata.
 
 ### 0.2 Data layer decisions (locked in early)
 
 - **SQLite** for the coordination layer (`tasks.db` or similar). Task
-  queue, leases, contracts, evidence log, type proposals.
+  queue, leases, contracts, evidence log, type proposals. Not needed
+  in Phase 0 but reserved as a design decision.
 - **DuckDB** for the analytical layer (`warehouse.duckdb`). Functions,
   basic blocks, P-Code instructions, MMIO events, register accesses,
   derived facts. This is the single highest-leverage architectural
-  choice in the whole plan — the 10-100x analytical query speedup over
-  SQLite pays for itself on day one of real use.
-- **Parquet** as the intermediate format between pipeline stages. Ghidra
-  dumps to Parquet; Renode traces dump to Parquet; everything ingests
-  from Parquet. DuckDB can query Parquet files directly without
-  importing them, which makes debugging and iterative schema work
-  dramatically easier than with JSON or ad-hoc SQL imports.
-- Sketch a first schema based on `pipeline-architecture.md`. Expect it
-  to change; schema migrations are cheap when everything is rebuildable
-  from source.
+  choice in the whole plan — the 10-100x analytical query speedup
+  over SQLite pays for itself on day one of real use.
+- **Parquet or JSONL** as the intermediate format between pipeline
+  stages. Ghidra dumps structured output; everything ingests from it.
+  JSONL is simpler to write from Ghidrathon (no pyarrow dependency
+  inside Ghidra); Parquet is faster once the volume grows. Start with
+  JSONL.
+- First schema has just the `functions` table. Every other table is
+  added by migration as later stages need them.
 
-### 0.3 Ghidra extraction (Stage 0)
+### 0.3 Build the first test target
 
-- Install Ghidrathon so scripts can be written in Python 3.
-- Write an extraction script that dumps: functions, basic blocks, call
-  graph edges, xrefs, strings, HighFunction IR, decompiler output.
-- Output format: Parquet files, one per table (`functions.parquet`,
-  `basic_blocks.parquet`, etc.), in `build/ghidra_export/`.
-- Write an ingest rule that loads the Parquet into DuckDB.
-- Run it against the firmware and confirm counts are sane.
+- Install the ARM toolchain: `brew install --cask gcc-arm-embedded`.
+- Clone the Raspberry Pi Pico SDK somewhere convenient and export
+  `PICO_SDK_PATH`.
+- Build the `blink` example: `cmake -B build && cmake --build build`.
+- Copy the resulting `blink.elf` into `ripcord/targets/pico_blinky/`
+  and add an entry to `config.yaml`.
 
-### 0.4 Renode platform port (Stage 2 prerequisite)
+This is maybe 15 minutes of setup time from zero on a machine that
+already has CMake installed.
 
-- Start from a mainline STM32F4 `.repl` file and patch for AT32F403A.
-  Adjust clock tree, flash size, SRAM size, and any peripherals that
-  differ.
-- **Explicitly capture every AT32-vs-STM divergence already discovered
-  during manual RE in a `platform_quirks` table and in comments in the
-  `.repl` file.** These are load-bearing facts; losing them is expensive.
-- Confirm the firmware boots at least to the point of touching the
-  EXMC/FSMC bus. That is the first meaningful milestone and should
-  happen within the first few hundred instructions.
+### 0.4 Ghidra extraction (Stage 0)
 
-### 0.5 MMIO trace capture
+- Install Ghidrathon so scripts can be written in Python 3 (see
+  `SETUP.md`).
+- The extraction script `scripts/ghidra/export_functions.py` dumps
+  per-function metadata: address, size, name, is_thunk, num_params,
+  calling convention, basic block count, signature.
+- Output format: JSONL, one file per target, in
+  `build/<target>/functions.jsonl`.
+- The ingest script `scripts/ingest/load_functions.py` loads JSONL
+  into the DuckDB warehouse at `build/warehouse.duckdb`.
+- Run it against the Pico blinky and confirm the function count
+  matches the unstripped ELF's symbol table.
 
-- Add a `BusPeripheral` model for the FPGA address range (EXMC/FSMC
-  bank). Log every access with full context: cycle, PC, address, value,
-  direction, access size.
-- Capture the first scenario: "boot and idle 2 seconds."
-- Dump the trace as Parquet, ingest into DuckDB.
-- Run one ad-hoc query: "show me every distinct FPGA register touched in
-  the first 100ms of boot." This is your first piece of novel insight
-  from the pipeline, and it should arrive on day 3 or 4.
+### 0.5 Snakemake orchestration
 
-### 0.6 Snakemake orchestration
+- `Snakefile` has two rules for Phase 0: `ghidra_export` and
+  `ingest_to_duckdb`.
+- Target list comes from `config.yaml`. Adding a new target is one
+  edit to the config — no rule changes needed.
+- Confirm the DAG runs end-to-end from a clean state:
+  `rm -rf build && snakemake --cores 4`.
 
-- Write a minimal `Snakefile` with three rules: `ghidra_export`,
-  `ingest_ghidra`, `renode_trace_boot`, `ingest_trace`.
-- Confirm the DAG runs end-to-end from a clean state.
-- From here, every new pipeline stage is one more rule.
+### 0.6 First query against the warehouse
 
-**Phase 0 exit criteria:** you can run `snakemake` from scratch and end
-up with a DuckDB warehouse containing functions, call graph, and one
-Renode MMIO trace. You can write a SQL query against it and get answers.
+- After the pipeline runs, query the warehouse:
+  ```bash
+  duckdb build/warehouse.duckdb \
+    "SELECT source, COUNT(*) AS functions FROM functions GROUP BY source"
+  ```
+- Compare against ground truth from the unstripped ELF
+  (`arm-none-eabi-nm blink.elf | grep ' [Tt] ' | wc -l`). The numbers
+  should match or be very close.
+
+**Phase 0 exit criteria:** you can run `snakemake` from scratch and
+end up with a DuckDB warehouse containing function metadata for at
+least one test target. You can write a SQL query against it and get
+answers. The pipeline exists.
+
+### 0.7 Add a second test target
+
+Once the pipeline works on one target, adding more is cheap. Target
+candidates in rough order of value:
+
+1. **Pico SDK with FreeRTOS port.** Same toolchain as the first
+   target, adds RTOS code to the mix. Tests library identification.
+2. **Zephyr `samples/hello_world` on `qemu_cortex_m3`.** Different
+   RTOS, QEMU-runnable (no hardware needed for emulation testing).
+3. **STM32 CubeMX blinky sample.** Exposes ST HAL for vendor library
+   identification.
+4. **Arduino Uno blink.** AVR architecture, 8-bit, drastically
+   different. Tests cross-architecture generality of the pipeline.
+5. **An ESP32-C3 blinky (RISC-V).** Yet another architecture.
+
+Aim for three targets working through the full pipeline before moving
+to Phase 1.
 
 ## Phase 1 — Library identification and fact population
 
-**Goal:** collapse the unknown surface before spending any LLM budget.
+**Goal:** collapse the unknown surface of each target before spending
+any LLM budget.
 
-### 1.1 Build FreeRTOS and AT32 SDK
+### 1.1 Build a library reference set
 
-- Compile FreeRTOS with likely toolchain flags for the AT32F403A target.
-- Compile the AT32 SDK HAL and driver library.
-- Produce ELF files with full symbol tables preserved.
+- Compile FreeRTOS with canonical toolchain flags for Cortex-M
+  targets (multiple versions, multiple optimization levels).
+- Compile Zephyr for a handful of sample boards.
+- Compile common vendor HALs (ST STM32, Nordic nRF, Silabs, NXP,
+  Artery AT32) against their published SDKs.
+- Compile common embedded libraries (lwIP, mbedTLS, FatFS, LittleFS,
+  tinyusb) in representative configurations.
+- Produce ELF files with full symbol tables preserved. These become
+  the signature corpus.
 
 ### 1.2 Signature matching
 
-- Extract byte patterns, basic-block hashes, and structural features
-  from the compiled libraries.
-- Match against functions in the firmware DuckDB warehouse.
-- Populate `functions.inferred_name` and `functions.contract_json` for
-  matches. Tag confidence levels (exact match vs. structural match vs.
-  fuzzy).
-- Produce a coverage report: "X% of firmware bytes identified as
-  library code."
+- Extract byte patterns, basic-block hashes, structural features,
+  and constant sets from the compiled libraries.
+- Match against functions in the target DuckDB warehouse.
+- Populate `functions.inferred_name` and `functions.contract_json`
+  for matches. Tag confidence levels (exact match vs. structural
+  match vs. fuzzy).
+- Produce a coverage report per target: "X% of bytes identified as
+  library code, with Y distinct libraries recognized."
 
-### 1.3 More scenario captures
+### 1.3 Renode platform and trace capture
 
-- Add Renode scenarios for every feature reachable in emulation: button
-  presses, USB events, LCD operations, UART traffic, any sensor reads.
-- Each scenario produces its own Parquet trace file, ingested into the
-  warehouse tagged with `scenario_id`.
-- The more scenarios captured, the more signal the downstream stages
-  have to work with.
+- Pick a test target suitable for Renode emulation (Pico, Zephyr
+  QEMU target, or STM32 Discovery board sample).
+- Add Renode scenarios for every observable behavior the target
+  exposes: boot, idle, any interactive events, any sensor activity,
+  any peripheral use.
+- Each scenario produces its own trace, ingested into the warehouse
+  tagged with `scenario_id`.
 
 ### 1.4 Static trace analysis
 
-- Cluster MMIO events by address to discover FPGA registers.
+- Cluster MMIO events by address to discover the peripheral register
+  map for each target.
 - Classify access patterns: read-only, write-only, polled, FIFO-like,
   command/status.
 - Correlate events with functions via recorded PC values.
-- Populate `fpga_registers` and `register_accesses` tables.
-- Produce a draft register map as a rendered `build/registers.md`.
+- Populate `registers` and `register_accesses` tables.
+- Produce a draft register map per target as a rendered
+  `build/<target>/registers.md`.
 
-**Phase 1 exit criteria:** you have a first-pass FPGA register map and
-you know which firmware functions touch the FPGA and which are library
-code. This alone is a huge jump forward versus the current manual
-approach and could already be enough to start writing replacement
-firmware for simple features.
+**Phase 1 exit criteria:** for each target, you have a first-pass
+peripheral register map and you know which functions are library code
+vs. application-specific. The deterministic pre-pass is doing most of
+the work; the LLM swarm in later phases will only see the residue.
 
 ## Phase 2 — Derivation and formal analysis
 
@@ -250,13 +294,18 @@ measurable and trending up.
 - These are for humans to read and to reference while writing
   replacement code.
 
-### 5.2 Write replacement firmware
+### 5.2 Write replacement firmware (if that is the goal)
 
-- Written fresh against the spec, in whatever language makes sense
-  (probably C with the AT32 SDK, but the option is open).
+- For projects where the goal is a replacement binary: written fresh
+  against the spec, in whatever language makes sense for the target
+  (usually C with the vendor SDK).
 - Verified against captured Renode scenarios continuously in CI.
 - Coverage metric: percent of original feature scenarios that the
   replacement reproduces with matching MMIO traces.
+- For projects with other goals (SBOM extraction, vulnerability
+  analysis, protocol recovery), this phase is replaced by whatever
+  downstream consumption pattern the goal requires — the database is
+  already populated.
 
 ### 5.3 Hardware bring-up
 
@@ -270,14 +319,13 @@ measurable and trending up.
 These are unresolved and will block later phases if left unanswered:
 
 1. **Python version, Ghidra version, Ghidrathon version matrix.** Lock
-   these at the start and document them.
-2. **Exact Renode platform file base** — which upstream STM32F4 `.repl`
-   to fork from. Probably `Nucleo_F401RE` or similar, but the AT32F403A
-   is closer to an F103/F107 in some respects. Worth 30 minutes of
-   research before committing.
-3. **How to scope scenarios.** A "feature" is fuzzy. Probably: every
-   user-observable behavior gets its own scenario, plus one or two
-   catch-all boot/idle scenarios. Iterate.
+   these at the start and document them in SETUP.md.
+2. **Renode platform baselines per target.** Most Cortex-M targets
+   have upstream `.repl` files in the Renode repo; pick and document
+   the baseline for each test target as it is added.
+3. **How to scope scenarios.** A "scenario" is a unit of observable
+   behavior. For blinky it's trivial ("boot, watch the LED GPIO for
+   2s"). For richer targets, scope is an open question. Iterate.
 4. **Confidence scoring scheme.** 0-1 float? Categorical (low/med/high)?
    The evidence log's usefulness depends on this being consistent.
 5. **Which LLM(s) to use, and what API budget per iteration.** This
@@ -308,18 +356,19 @@ Things that are tempting but should wait:
 - **Don't over-abstract the Snakemake rules.** Simple, explicit, one
   rule per logical stage. Generalize only when you've written the same
   pattern three times.
-- **Don't lose the AT32 quirks you've already found.** Every one of them
-  should end up in `platform_quirks` and in comments in the Renode
-  `.repl` file by the end of Phase 0.
+- **Don't lose chip-specific quirks once you start finding them.**
+  For any target, platform divergences from the baseline (e.g., AT32
+  vs STM32F4, vendor silicon errata) are load-bearing facts that
+  should live in a `platform_quirks` table and in comments in the
+  Renode `.repl` file. Losing them is expensive.
 
 ## Highest-leverage single action right now
 
-If only one thing gets done this week: **port the Renode platform file
-and capture a boot trace with FSMC bus logging.** Everything else in the
-pipeline is about amplifying and querying that trace. Without it, the
-rest of the pipeline has nothing to anchor against. With it, you already
-know more about what the firmware does to the FPGA than you could learn
-from a week of staring at Ghidra.
+If only one thing gets done this week: **build the Pico SDK blinky
+target and get the Phase 0 pipeline running against it end-to-end.**
+That is the milestone where ripcord stops being a design document and
+starts being a working tool. Every subsequent target, every subsequent
+pipeline capability, is incremental from there.
 
 ## Where learned fingerprinting fits into the roadmap
 
@@ -331,8 +380,8 @@ learned extension. The phasing:
 - **Fingerprinting Phase 1 — Rules.** Slots into main Phase 1
   (Library identification). Constants database, string matching,
   MMIO-range classification, structural matching against compiled
-  FreeRTOS and AT32 SDK references. No ML. Probably covers 60-80% of
-  library code alone.
+  reference libraries (FreeRTOS, Zephyr, vendor HALs). No ML.
+  Probably covers 60-80% of library code alone.
 - **Fingerprinting Phase 2 — Hand-crafted features + GBDT.** Slots in
   after main Phase 1 is stable. XGBoost or LightGBM over explicit
   features. Adds incremental coverage, stays interpretable, no deep
@@ -351,13 +400,8 @@ Each fingerprinting phase is independently useful and each makes the
 downstream agent work cheaper. Stopping at Phase 1 still leaves the
 main pipeline working; stopping at Phase 2 gives most of the
 practical value with no ML dependencies; Phases 3 and 4 are the
-research directions that also happen to improve cord-specific work.
-
-For cord specifically, Phases 1 and 2 of fingerprinting are almost
-certainly sufficient. Phases 3 and 4 are worth pursuing if the broader
-research direction is interesting on its own merits. See
-`use-cases-and-strategy.md` for framing on when the research angle is
-worth the additional investment.
+research directions. See `use-cases-and-strategy.md` for framing on
+when the research angle is worth the additional investment.
 
 ## The "minutes, not days" design constraint
 

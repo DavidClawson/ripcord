@@ -1,38 +1,52 @@
 # ripcord — Firmware RE Pipeline Design Notes
 
-Working notes for **ripcord**, a tooling-heavy reverse-engineering pipeline
-targeted at the `APP_2C53T_V1.2.0_251015.bin` firmware in the cord project.
-The firmware runs on an ArteryTek AT32F403A (Cortex-M4, STM32F4-compatible-ish)
-and talks to an opaque FPGA over what is almost certainly the EXMC/FSMC
-external bus.
+Working notes for **ripcord**, a research pipeline for reverse engineering
+embedded firmware. The pipeline takes an opaque binary in and expands it
+into a queryable, structured fact database that downstream tools —
+deterministic analyzers, formal methods, and LLM agents — can operate on
+without ever having to read the raw binary.
 
-The name: pull the cord on a parachute, and a carefully packed structure
+The name: pull a ripcord on a parachute, and a carefully packed structure
 tumbles out and inflates into something functional. That's what this
-pipeline does — one command takes an opaque binary in, and a structured,
-queryable fact database expands out. "Rip" also fits: ripping ROMs,
-ripping apart code. Cord is the target; ripcord is the tool that opens it.
-
-## Project context
-
-- **End goal:** write replacement firmware that drives the existing hardware
-  (MCU + FPGA) faithfully enough to be a drop-in.
-- **Hard constraint:** the FPGA is a black box. The only way to characterize
-  its interface is through the MCU's interactions with it, as encoded in this
-  binary.
-- **Current state:** ~2 weeks of traditional manual RE completed. AT32-vs-STM32
-  divergences already discovered during that work; those are real and need to
-  be tracked explicitly.
+pipeline does to firmware binaries. "Rip" also fits: ripping ROMs,
+ripping apart code.
 
 ## Core thesis
 
-The firmware is, by construction, a complete executable specification of the
-FPGA's interface. Every register, every sequence, every timing constraint is
-in there — the MCU could not drive the FPGA otherwise. The problem is bounded.
+Most of the work of reverse-engineering a well-behaved embedded binary
+is not creative. Library code can be identified by structural matching.
+Control flow can be recovered by static analysis. Hardware interactions
+can be observed by emulation. Semantic equivalence can be verified by
+differential execution. All of this is **deterministic automation** that
+should run in minutes, not days, and should happen before any human
+judgment or LLM involvement.
 
-The pipeline's job is to extract that specification at a scale and speed that
-manual reading cannot match, using a combination of static analysis, dynamic
-emulation, formal tools, and an LLM agent swarm coordinated through a
-structured fact database.
+What remains after the deterministic pre-pass is the genuinely
+application-specific code — the code that matters, the code that makes
+the device distinctive. That residue is where an LLM agent swarm earns
+its keep, operating against a pre-enriched structured database rather
+than a raw 700KB binary. Every claim the swarm makes is verified by
+execution before entering the canonical state.
+
+The pipeline is built around this structure: heavy investment in the
+deterministic fast path, so that when agents finally run, they spend
+their budget exclusively on the things deterministic tools genuinely
+cannot do.
+
+## Inspiration and running example
+
+ripcord was originally inspired by manual reverse-engineering work on a
+proprietary firmware with an opaque FPGA peripheral (the "cord" project).
+Several design arguments in these notes — the hardware-boundary spec
+framing, the FPGA-API-is-encoded-in-the-firmware observation, the
+Renode-as-ground-truth thesis — were sharpened on that specific case.
+The notes occasionally use the cord case as a running example or as an
+illustrative extreme.
+
+**The pipeline is not coupled to any specific target.** It is designed
+to work on any embedded firmware. The cord case is a motivating example
+and a possible future stress test; it is not a requirement and not the
+scope.
 
 ## Documents in this folder
 
