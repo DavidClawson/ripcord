@@ -1,8 +1,9 @@
 # ripcord — Phase 0 pipeline
 #
-# Extracts function metadata from each target binary via Ghidra headless
-# (driving a PyGhidra postScript) and writes the results as typed Parquet
-# files under build/<target>/tables/. Targets are declared in config.yaml.
+# Extracts function-level metadata from each target binary via Ghidra
+# headless (driving PyGhidra postScripts) and writes the results as
+# typed Parquet files under build/<target>/tables/. Targets are
+# declared in config.yaml.
 #
 # The warehouse is the tree of parquet files, not an embedded database
 # file. Query it with scripts/query or any Parquet-capable tool. See
@@ -34,36 +35,47 @@ REPO_ROOT = Path(workflow.basedir).resolve()
 rule all:
     input:
         expand("build/{target}/tables/functions.parquet", target=TARGETS),
+        expand("build/{target}/tables/calls.parquet", target=TARGETS),
         expand("build/{target}/tables/ground_truth_functions.parquet", target=TARGETS),
 
 
-rule ghidra_export:
-    """Run Ghidra headless on one target binary and dump function metadata.
+rule ghidra_extract:
+    """Run Ghidra headless once per target, dumping every JSONL the
+    pipeline cares about as postScript outputs from the same session.
 
-    The PyGhidra postScript writes a JSONL file (one function per line).
+    Running Ghidra once and emitting multiple JSONLs is strictly
+    better than one-Ghidra-run-per-table: auto-analysis dominates the
+    per-target wall time, so amortizing it across every extraction
+    script keeps the "minutes, not days" constraint honest as the
+    warehouse grows.
+
     Ghidra's project database lives under build/<target>/ghidra_project/
-    so reruns are incremental. `pyghidraRun -H` is analyzeHeadless launched
-    under PyGhidra, which is what lets the .py postScript see a Python 3
-    runtime.
+    so reruns are incremental. `pyghidraRun -H` is analyzeHeadless
+    launched under PyGhidra, which is what lets the .py postScripts
+    see a Python 3 runtime.
     """
     input:
         elf = lambda wc: config["targets"][wc.target]["elf"],
     output:
-        jsonl = "build/{target}/functions.jsonl",
+        functions_jsonl = "build/{target}/functions.jsonl",
+        calls_jsonl = "build/{target}/calls.jsonl",
     params:
         project_dir = lambda wc: f"build/{wc.target}/ghidra_project",
         project_name = lambda wc: wc.target,
         script_path = str(REPO_ROOT / "scripts" / "ghidra"),
-        output_abs = lambda wc: str((REPO_ROOT / f"build/{wc.target}/functions.jsonl").resolve()),
+        functions_out = lambda wc: str((REPO_ROOT / f"build/{wc.target}/functions.jsonl").resolve()),
+        calls_out = lambda wc: str((REPO_ROOT / f"build/{wc.target}/calls.jsonl").resolve()),
     shell:
         r"""
-        mkdir -p {params.project_dir} $(dirname {output.jsonl})
+        mkdir -p {params.project_dir} $(dirname {output.functions_jsonl})
         {GHIDRA_PYGHIDRA} -H {params.project_dir} {params.project_name} \
             -import {input.elf} \
             -overwrite \
             -scriptPath {params.script_path} \
-            -postScript export_functions.py {params.output_abs}
-        test -s {output.jsonl}
+            -postScript export_functions.py {params.functions_out} \
+            -postScript export_calls.py     {params.calls_out}
+        test -s {output.functions_jsonl}
+        test -s {output.calls_jsonl}
         """
 
 
@@ -75,7 +87,24 @@ rule ingest_functions:
         parquet = "build/{target}/tables/functions.parquet",
     shell:
         r"""
-        {PYTHON} scripts/ingest/load_functions.py \
+        {PYTHON} scripts/ingest/load_table.py \
+            --table functions \
+            --source {wildcards.target} \
+            --output {output.parquet} \
+            {input.jsonl}
+        """
+
+
+rule ingest_calls:
+    """Load one target's call-reference JSONL into a typed Parquet table."""
+    input:
+        jsonl = "build/{target}/calls.jsonl",
+    output:
+        parquet = "build/{target}/tables/calls.parquet",
+    shell:
+        r"""
+        {PYTHON} scripts/ingest/load_table.py \
+            --table calls \
             --source {wildcards.target} \
             --output {output.parquet} \
             {input.jsonl}
