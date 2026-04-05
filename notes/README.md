@@ -56,6 +56,9 @@ scope.
 - [`pipeline-architecture.md`](./pipeline-architecture.md) — stages of the
   pipeline, the blackboard/database coordination model, contracts-as-headers,
   locking, evidence log, convergence.
+- [`design-decisions.md`](./design-decisions.md) — chronological log of
+  major architectural choices with the reasoning behind each. Check
+  this before proposing anything that revisits a prior decision.
 - [`tooling.md`](./tooling.md) — reference sheet for every tool discussed
   (Ghidra, Renode, Unicorn, angr, Soufflé, DuckDB, Snakemake, etc.) with
   what each does and when to reach for it.
