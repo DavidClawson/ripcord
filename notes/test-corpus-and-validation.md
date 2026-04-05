@@ -7,6 +7,19 @@ it, and feed it to the pipeline. Then compare what the pipeline recovers
 against the source you started from. Every discrepancy is either a
 pipeline bug or a genuinely hard RE problem worth studying.
 
+> **Status update (2026-04-05):** validation is live. The ground-
+> truth comparison against `nm -S` is a committed pipeline rule
+> (`ground_truth_functions.parquet`) with a committed regression
+> query (`notes/queries/coverage.sql`). Three targets have been
+> run through it: Pico blinky (68.8% raw coverage, 100% of real
+> function bodies — the gap is non-function symbols documented in
+> `notes/ghidra-extraction-notes.md`) and two Zephyr samples on
+> qemu_cortex_m3 (97.0% raw coverage each). The test-difficulty
+> ramp below was followed roughly in order: step 1 (Pico blinky)
+> is done; the intermediate steps were partially skipped in favor
+> of a Zephyr sample because the Zephyr pair was specifically
+> needed to validate the structural fingerprinting primitive.
+
 This also doubles as the foundation for a **fingerprint library** that
 makes Stage 1 (library identification) dramatically more powerful — not
 just for this project, but reusable across any future firmware RE work.
@@ -295,6 +308,13 @@ collapses the unknown surface on the real target.
 - **Toolchain drift is real.** Signatures compiled with GCC 11 often
   don't match GCC 13 output. The multi-config approach mitigates this
   but doesn't eliminate it.
+- **Build-matrix mismatches are even more real, and were empirically
+  verified on 2026-04-05.** Same toolchain alone is not sufficient
+  for cross-target matching. The actual requirement is matching
+  (ISA, -O level, libc, link surface). A reference corpus for
+  rule-based Phase 1 fingerprinting must span the build tuples
+  that target binaries use, not just the source libraries. See
+  design-decision D18 and `notes/fingerprinting-baseline.md`.
 - **The cord firmware's exact toolchain is unknown** and matters for
   signature matching. Worth investigating whether any vendor artifacts
   (e.g., compiler version strings embedded in the binary, ELF notes if

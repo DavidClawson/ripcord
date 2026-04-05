@@ -9,8 +9,13 @@ Every tool discussed in design, what it does, and when to reach for it.
 NSA's open-source reverse engineering framework. The backbone of the
 pipeline's static extraction.
 
-- **Headless mode** (`analyzeHeadless`) is how you run it from a script or
-  CI. No GUI, no clicking, deterministic.
+- **Headless mode** is how you run it from a script or CI. No GUI,
+  no clicking, deterministic. This project uses `pyghidraRun -H`
+  (which is `analyzeHeadless` launched under Ghidra's native
+  PyGhidra Python 3 runtime) rather than plain `analyzeHeadless`,
+  so `.py` postScripts can import the venv's packages. See
+  `design-decisions.md` §D17 and `SETUP.md` for the full launcher
+  setup including the `JAVA_HOME` requirement.
 - **P-Code** is Ghidra's intermediate representation — a normalized,
   architecture-independent form lower-level than decompiled C but more
   structured than raw assembly. The natural unit for agent tasks.

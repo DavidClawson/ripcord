@@ -27,18 +27,47 @@ testing.
 
 ## Stages
 
-### Stage 0 — Ingest
+### Stage 0 — Ingest (current state: wide, five tables live)
 
-- Run Ghidra headless (`pyghidraRun -H`, which is `analyzeHeadless`
-  launched under PyGhidra's Python 3 runtime) on the firmware binary.
-- Export: function list, basic blocks, P-Code / HighFunction IR, call graph,
-  xrefs, strings, data references, initial decompiler output.
-- Emit as Parquet files (typed, compressed, columnar — far better than JSON
-  for millions of rows). JSON is acceptable as a debugging intermediate.
-- A separate ingest step reads the Parquet and populates the database.
+- Run Ghidra headless via `pyghidraRun -H` (Ghidra's native PyGhidra
+  launcher = `analyzeHeadless` under a Python 3 runtime) on the
+  firmware binary. One Ghidra session per target, multiple
+  `-postScript` flags emit all the JSONL outputs in parallel so
+  auto-analysis runs once per target.
+- Each extractor script emits a JSONL file; a generic ingest
+  script (`scripts/ingest/load_table.py`) converts each JSONL to
+  a typed Parquet table using the schema in
+  `scripts/ingest/schemas.py`.
+- The warehouse is the tree of Parquet files under
+  `build/<target>/tables/`. There is no embedded DB file; DuckDB
+  is invoked ad hoc via `scripts/query` over the tree. Rationale:
+  design-decision D15.
 
-Output: populated `functions`, `basic_blocks`, `calls`, `xrefs`, `strings`
-tables with zero analysis applied.
+Current tables produced by Stage 0:
+
+| table                    | extractor                          |
+|--------------------------|------------------------------------|
+| `functions`              | `export_functions.py`              |
+| `calls`                  | `export_calls.py`                  |
+| `basic_blocks`           | `export_basic_blocks.py`           |
+| `xrefs`                  | `export_xrefs.py` (non-call refs)  |
+| `strings`                | `export_strings.py` (loaded memory only) |
+| `ground_truth_functions` | `load_ground_truth.py` (nm -S)     |
+
+Not yet produced (deferred):
+
+- **P-Code / HighFunction IR** — `export_pcode.py` does not exist
+  yet. Prerequisite for D9 (learned P-Code embeddings) and for
+  cross-ISA fingerprinting generally.
+- **Data references separate from xrefs** — currently folded into
+  `xrefs` with a `ref_type` column. Split if a use case demands
+  it.
+- **Decompiler output** — not captured at Stage 0. Ghidra's
+  decompiler produces per-function pseudo-C that would be
+  useful for LLM context assembly in Phase 3, but it's not a
+  free extraction (the decompiler is slow relative to the static
+  API) and deferring it preserves the "minutes, not days"
+  constraint.
 
 ### Stage 1 — Library identification
 

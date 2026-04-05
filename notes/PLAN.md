@@ -4,7 +4,26 @@ Broad, phased, intentionally preserving every thread from the design
 discussion. Steps within a phase are roughly sequential; phases overlap in
 practice.
 
-## Phase 0 — Bootstrapping (days, not weeks)
+## Status snapshot (2026-04-05)
+
+**Phase 0:** ✅ complete. Three targets in warehouse (`pico_blinky`,
+`zephyr_hello_world`, `zephyr_synchronization`), all five Stage 0
+tables populated (`functions`, `calls`, `basic_blocks`, `xrefs`,
+`strings`) plus `ground_truth_functions` regression signal. See
+`CLAUDE.md` "Current state" for the live numbers.
+
+**Phase 1:** partially validated. The rule-based structural
+fingerprinting primitive works at ~96% cluster-level precision on
+two Zephyr targets with matching build configs; fails cleanly on
+Pico↔Zephyr where build configs mismatch. See
+`notes/fingerprinting-baseline.md`. Reference corpus build and
+the remaining Phase 1 steps (MMIO ranges, Renode traces, register
+map) have not started.
+
+**Phases 2+:** not started. Deferred until Phase 1 library ID is
+working against a homogeneous reference corpus.
+
+## Phase 0 — Bootstrapping (days, not weeks) ✅ COMPLETE
 
 **Goal:** minimal viable pipeline skeleton that the rest can grow
 into. No LLMs, no agents, no Datalog. Just extract, store, and query.
@@ -99,12 +118,12 @@ already has CMake installed.
   (`arm-none-eabi-nm blink.elf | grep ' [Tt] ' | wc -l`). The numbers
   should match or be very close.
 
-**Phase 0 exit criteria:** you can run `snakemake` from scratch and
-end up with a tree of Parquet tables containing function metadata
-for at least one test target. You can write a SQL query against it
-(via `scripts/query`) and get answers. The pipeline exists.
+**Phase 0 exit criteria:** ✅ met. Running `snakemake` from scratch
+produces `build/<target>/tables/functions.parquet` for every target
+in `config.yaml`; `scripts/query` executes arbitrary SQL against
+the warehouse. Three targets currently pass.
 
-### 0.7 Add a second test target
+### 0.7 Add a second test target ✅ done (and a third)
 
 Once the pipeline works on one target, adding more is cheap. Target
 candidates in rough order of value:
@@ -121,6 +140,38 @@ candidates in rough order of value:
 
 Aim for three targets working through the full pipeline before moving
 to Phase 1.
+
+**What actually happened (2026-04-05):** targets added were Pico
+SDK blinky (Cortex-M0+, newlib), Zephyr hello_world on
+qemu_cortex_m3 (Cortex-M3, picolibc), and Zephyr synchronization
+on the same qemu_cortex_m3 board. The two Zephyr targets share a
+build config, which turned out to matter a lot for Phase 1 — see
+`notes/fingerprinting-baseline.md`. A Pico SDK FreeRTOS build was
+skipped in favor of the second Zephyr sample because that test
+was specifically needed to validate the structural fingerprinting
+primitive under same-build conditions.
+
+### 0.8 Stage 0 widening (done 2026-04-05)
+
+The original Phase 0 scaffold only emitted the `functions` table.
+All five Stage 0 tables from `pipeline-architecture.md` are now
+populated by the pipeline:
+
+- `functions` — address, size, name, calling convention, params, etc.
+- `calls` — one row per call site (caller_addr, call_site_addr, callee_addr, ref_type, is_computed)
+- `basic_blocks` — per CodeBlock with containing function, block size, instruction count
+- `xrefs` — every non-call reference from within function bodies (reads, writes, jumps, data)
+- `strings` — defined strings in loaded memory only (debug section overlays filtered out)
+
+Plus the Phase 0.6 regression signal:
+
+- `ground_truth_functions` — T/t symbols extracted from `nm -S`, per target arch
+
+Every table was designed, added to `scripts/ingest/schemas.py`,
+extracted via a `scripts/ghidra/export_<table>.py` PyGhidra
+postScript, and ingested via the generic `scripts/ingest/load_table.py`
+loader. Adding new tables is now a ~3-file addition with no
+surprises.
 
 ## Phase 1 — Library identification and fact population
 
@@ -149,6 +200,21 @@ any LLM budget.
   match vs. fuzzy).
 - Produce a coverage report per target: "X% of bytes identified as
   library code, with Y distinct libraries recognized."
+
+**Partial implementation (2026-04-05):** the structural-feature
+half of this step is implemented as `notes/queries/structural_signatures.sql`
+and validated end-to-end against two Zephyr targets. Feature
+vector is `(size, basic_block_count, instruction_count,
+outgoing_calls, distinct_callees, reads, writes, jumps)` aggregated
+from the five Stage 0 tables. Strict 8-tuple match hits 96% cluster-
+level precision on same-build target pairs. The baseline has three
+known limitations: it fails on cross-build-config target pairs
+(different ISA, -O, libc), it has within-target structural twins
+(~3 in 75 clusters on Zephyr), and it doesn't produce a
+`functions.inferred_name` column yet (it reports matches at the
+cluster level, not by writing back to the warehouse). All three
+are known next steps — see `notes/fingerprinting-baseline.md` for
+the concrete fix list.
 
 ### 1.3 Renode platform and trace capture
 
@@ -323,22 +389,51 @@ measurable and trending up.
 
 ## Open questions / decisions to make early
 
-These are unresolved and will block later phases if left unanswered:
+These are unresolved and will block later phases if left unanswered.
 
-1. **Python version, Ghidra version, `pyghidra`/`jpype1` version
-   matrix.** Lock these at the start and document them in SETUP.md.
-   (Ghidrathon is obsolete on Ghidra 11.2+; see D17.)
-2. **Renode platform baselines per target.** Most Cortex-M targets
+**Resolved or answered this session (kept for history):**
+
+- ~~Python version, Ghidra version, Ghidrathon version matrix.~~
+  Resolved. Ghidra 11.2+ ships PyGhidra natively; Ghidrathon is
+  obsolete; see D17. Currently running Ghidra 12.0.4 + pyghidra
+  3.0.2 + jpype1 1.5.2 + Python 3.14. JAVA_HOME must point at
+  Homebrew openjdk@21 for PyGhidra.
+
+- ~~How to cross-target match compiled library code.~~ Partially
+  answered. The "same toolchain = same code" hypothesis was too
+  weak; the correct condition is matching (ISA, -O, libc, link
+  surface). For rule-based Phase 1 fingerprinting this constrains
+  the reference corpus to span the build matrix; for cross-ISA
+  fingerprinting it points at P-Code-level features (see D9).
+  Empirical backing in `notes/fingerprinting-baseline.md`.
+
+**Still open:**
+
+1. **Renode platform baselines per target.** Most Cortex-M targets
    have upstream `.repl` files in the Renode repo; pick and document
-   the baseline for each test target as it is added.
-3. **How to scope scenarios.** A "scenario" is a unit of observable
+   the baseline for each test target as it is added. `qemu_cortex_m3`
+   in particular emulates TI LM3S6965 — Renode has this board.
+2. **How to scope scenarios.** A "scenario" is a unit of observable
    behavior. For blinky it's trivial ("boot, watch the LED GPIO for
    2s"). For richer targets, scope is an open question. Iterate.
-4. **Confidence scoring scheme.** 0-1 float? Categorical (low/med/high)?
+3. **Confidence scoring scheme.** 0-1 float? Categorical (low/med/high)?
    The evidence log's usefulness depends on this being consistent.
+   This is **blocking** the first table that gains a `confidence`
+   column — the structural fingerprinting write-back will be the
+   first such table if we implement it that way. Write
+   `notes/confidence-scheme.md` before that happens. Estimated
+   cost: half an afternoon.
+4. **Reference corpus build matrix.** Given the finding that
+   matching build configs matter, the corpus needs to span
+   {ISA} × {-O level} × {libc} × {library}. How many points on
+   each axis for v1? Rough target: start with one library
+   (FreeRTOS) × one ISA (cortex-m0plus) × one -O (-O3) × one libc
+   (newlib), matching the Pico build config, and grow from there.
+   Build infrastructure should be designed from day 1 to make
+   adding points to the matrix trivial.
 5. **Which LLM(s) to use, and what API budget per iteration.** This
    drives Phase 3 cost directly and needs a rough sanity check before
-   the swarm goes live.
+   the swarm goes live. Not urgent — Phase 3 is far off.
 6. **Where to host the task queue once it outgrows SQLite.** Probably
    never, for a solo project — SQLite handles millions of rows fine —
    but worth knowing the escape hatch exists (Redis, Postgres, LMDB).
@@ -370,13 +465,46 @@ Things that are tempting but should wait:
   should live in a `platform_quirks` table and in comments in the
   Renode `.repl` file. Losing them is expensive.
 
-## Highest-leverage single action right now
+## Highest-leverage single action right now (updated 2026-04-05)
 
-If only one thing gets done this week: **build the Pico SDK blinky
-target and get the Phase 0 pipeline running against it end-to-end.**
-That is the milestone where ripcord stops being a design document and
-starts being a working tool. Every subsequent target, every subsequent
-pipeline capability, is incremental from there.
+Phase 0 is done and Phase 1 has a working structural primitive. The
+next single action is **close the 3-of-75 within-target collision
+gap in the structural signature query**, then **start the Phase 1
+reference corpus with FreeRTOS built for `cortex-m0plus -O3` to
+match Pico's build config**, then **add a Pico-FreeRTOS target**
+to exercise the corpus against an unknown(ish) binary.
+
+That sequence produces the project's first end-to-end library-ID
+result against an unknown target: a concrete "here are the FreeRTOS
+functions in this binary" answer with ~96%+ precision, using only
+SQL and the existing pipeline.
+
+Two concrete smaller fixes that unblock the above and are worth
+knocking out along the way:
+
+- **Name-aware post-processing** in `structural_signatures.sql`.
+  Pure SQL change, ~10 minutes, takes the cluster-level precision
+  from 96% to ~100% on named pairs by splitting clusters with
+  multiple distinct names.
+
+- **Byte-pattern hash column** in the `functions` table. A small
+  extractor addition (read function bytes, normalize relocations,
+  SHA-1) that gives every function a stable discriminator beyond
+  the current feature vector. Closes the within-target structural
+  twins gap for real.
+
+The original Phase 0 headline — "build Pico blinky and get the
+pipeline running end-to-end" — was the 2026-04-04 snapshot and is
+preserved below for history. It's done.
+
+---
+
+*Previous 2026-04-04 snapshot:* "If only one thing gets done this
+week: build the Pico SDK blinky target and get the Phase 0
+pipeline running against it end-to-end. That is the milestone
+where ripcord stops being a design document and starts being a
+working tool. Every subsequent target, every subsequent pipeline
+capability, is incremental from there."
 
 ## Where learned fingerprinting fits into the roadmap
 

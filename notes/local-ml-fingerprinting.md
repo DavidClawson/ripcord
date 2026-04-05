@@ -8,6 +8,22 @@ naturally with the rule-based fingerprinting already described
 elsewhere in these notes — rules handle the easy cases, a learned
 model handles the fuzzy residue.
 
+> **Validation from 2026-04-05:** the core premise of D9 (train on
+> Ghidra P-Code, not raw disassembly) has been empirically supported
+> by the rule-based baseline failure mode. Pico targets (Cortex-M0+,
+> armv6s-m) and Zephyr targets (Cortex-M3, armv7-m) share no
+> structural matches under a hand-crafted feature vector, even when
+> built with the same toolchain, because the ISAs produce different
+> instruction counts and block structures for the same source. P-Code
+> normalizes exactly those axes (register allocation, addressing
+> modes, architecture-specific opcodes), so the same C source should
+> produce similar P-Code across ISA boundaries. This is the motivating
+> use case for the P-Code embedding path: everything that fails in
+> `fingerprinting-baseline.md` under mismatched (ISA, -O, libc)
+> conditions is what the learned P-Code model is supposed to catch.
+> Design decision D18 records the corresponding constraint on the
+> rule-based side (reference corpus must span the build matrix).
+
 ## Why this idea has unusually good economics for ML
 
 Most ML projects in reverse engineering and security fail on labels.
@@ -102,6 +118,16 @@ produces P-Code for other reasons.
 pipeline.** Not because it's dramatic, but because it's a simple
 modification to an existing well-studied recipe that has a real chance
 of being a genuine improvement.
+
+**Note:** the current pipeline does not yet extract P-Code. The
+existing extractors (`export_functions.py`, `export_calls.py`,
+`export_basic_blocks.py`, `export_xrefs.py`, `export_strings.py`)
+pull metadata and references but not the actual P-Code ops. An
+`export_pcode.py` extractor is a prerequisite for this research
+thread. Expected shape: one row per (function_addr, pcode_seq_idx)
+with opcode, inputs, output varnodes, plus the containing basic
+block. Schema lives naturally in `scripts/ingest/schemas.py` as a
+new `pcode_ops` table.
 
 ## Multi-modal features
 

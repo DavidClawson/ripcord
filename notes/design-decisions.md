@@ -480,6 +480,92 @@ project venv, and `JAVA_HOME` is pointed at Homebrew's `openjdk@21`
 **Status:** active. Ghidrathon has been uninstalled and the Phase 0
 pipeline runs end-to-end under PyGhidra.
 
+## D18. Phase 1 reference corpus must span the target build matrix
+
+**Considered:** build a single "canonical" reference corpus
+(FreeRTOS + Zephyr + vendor HALs, one compilation each) and match
+every target against it; build a corpus that mirrors each target's
+build configuration separately; do no corpus work until a learned
+model replaces the need for one; defer the question.
+
+**Decided:** the reference corpus must span the build matrix the
+targets span. Each library compiles once per (ISA, -O level, libc,
+major toolchain version) combination that any target in the
+pipeline uses. Corpus entries are tagged with the build tuple and
+only match targets that share that tuple.
+
+**Reasoning — empirical, from `notes/fingerprinting-baseline.md`:**
+
+On 2026-04-05 the structural fingerprinting baseline was run across
+three targets: `pico_blinky` (Cortex-M0+, -O3, newlib),
+`zephyr_hello_world` (Cortex-M3, -Os, picolibc), and
+`zephyr_synchronization` (Cortex-M3, -Os, picolibc).
+
+- Pico ↔ Zephyr: **essentially zero useful matches**. The only
+  strict-match cluster was a tiny stub group. Even functions that
+  share a name across targets (`main`, `memcpy`) have different
+  sizes and block counts.
+- Zephyr hello_world ↔ Zephyr synchronization: **72 of 75 matches
+  have identical names across both targets, ~96% cluster-level
+  precision.** Matches include vfprintf (1278 bytes / 158 blocks),
+  z_thread_abort, skip_to_arg, k_sched_unlock, z_arm_fatal_error,
+  sys_clock_announce, and the rest of the real Zephyr kernel.
+
+The same query file, the same feature vector, the same day —
+radically different results depending on whether the target pair
+shared a build config.
+
+The working hypothesis going in ("same toolchain = same code") was
+too weak. The actual condition is *same ISA + same -O level + same
+libc + overlapping link surface*. Pico and Zephyr shared only
+`arm-none-eabi-gcc 15.2.1`; they differed on all four of the
+actually-load-bearing axes. The Zephyr pair shared all four.
+
+**Consequences:**
+
+1. **Rule-based fingerprinting (Phase 1) requires a corpus built
+   with matching flags.** A single FreeRTOS build for Cortex-M4
+   will not match a Cortex-M0+ target, even with the same source
+   code. The corpus build infrastructure has to treat the build
+   tuple as a first-class key, not an afterthought.
+
+2. **Cross-build-tuple matching requires ISA-invariant features.**
+   This is the use case for P-Code embeddings (D9 — train on
+   Ghidra P-Code, not raw disassembly). D18 does not replace D9;
+   the two are complementary. D18 says "for rule-based matching,
+   restrict to homogeneous builds"; D9 says "for the learned path,
+   use features that are invariant to the differences." Both are
+   correct; the right choice depends on whether you have a
+   matching-build corpus or not.
+
+3. **Corpus scope v1 is now concrete.** Start with FreeRTOS built
+   for `cortex-m0plus -O3` with newlib to match the Pico build
+   config. That's one library × one build tuple, a few hours of
+   work, and it immediately unlocks library ID on any Pico-class
+   target. Expand the matrix axis-by-axis as targets are added.
+
+4. **The build infrastructure should be Snakemake-driven from day
+   one.** Each (library, version, ISA, -O, libc, toolchain)
+   combination is a separate pipeline target with its own
+   `build/<libname>_<tuple>/tables/*.parquet`. Reference corpora
+   and targets of analysis share the same schema; a "match" is
+   just a join.
+
+**What this does not change:**
+
+- D9 remains correct. P-Code embeddings are still the right
+  approach for cross-ISA work. D18 is about what the rule-based
+  path needs; D9 is about what the learned path needs.
+- `pipeline-architecture.md` Stage 1 library identification still
+  works the way it's described. D18 sharpens the corpus
+  requirements without changing the stage's interface.
+- The "minutes, not days" constraint still applies to pipeline
+  runs. The corpus build can take longer; it's amortized across
+  every future target.
+
+**Status:** active. Corpus build has not started; FreeRTOS for
+`cortex-m0plus -O3` is the recommended first entry.
+
 ## How to use this log
 
 When proposing a new architectural direction, first check whether

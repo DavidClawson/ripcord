@@ -17,27 +17,99 @@ The name: pull a ripcord on a parachute, and a carefully packed
 structure tumbles out and inflates into something functional. Same
 operation, applied to firmware.
 
-## Current state (as of 2026-04-04)
+## Current state (as of 2026-04-05)
 
-**Phase 0 is complete.** The pipeline runs end-to-end on the
-Raspberry Pi Pico SDK blinky example: Ghidra headless (via PyGhidra)
-extracts per-function metadata, the ingest script writes it as
-`build/pico_blinky/tables/functions.parquet`, and the exit-criterion
-query returns real Pico SDK function names. The warehouse is a tree
-of Parquet files under `build/<target>/tables/`, not an embedded DB
-file — see `notes/design-decisions.md` §D15 for the rationale.
+**Phase 0 is complete, Stage 0 is wide, three targets are in the
+warehouse, and structural fingerprinting works at ~96% precision
+under same-build conditions.** The project has moved from
+"scaffolded" to "doing useful Phase 1 work" over two sessions.
 
-The Phase 0 exit criterion was: after `snakemake` succeeds, running
-`scripts/query "SELECT name, size FROM functions WHERE
-source='pico_blinky' ORDER BY size DESC LIMIT 10"` returns a list of
-function names from the Pico blinky binary. This currently passes.
+### Warehouse contents (per target)
 
-The next step is **widening Stage 0 extraction** to cover
-`basic_blocks`, `calls`, `xrefs`, and `strings`, before adding a
-second target. The plan's phrasing of "add a second target next" was
-deprioritized because widening extraction unlocks queries the
-single-table warehouse can't answer, while adding targets to a
-too-thin schema merely duplicates the thinness.
+Every `snakemake --cores 4` run produces six Parquet tables per
+target under `build/<target>/tables/`:
+
+| table                   | grain                                          |
+|-------------------------|------------------------------------------------|
+| `functions`             | one row per Ghidra-discovered function body    |
+| `calls`                 | one row per call reference (site-level)        |
+| `basic_blocks`          | one row per CodeBlock, with containing fn      |
+| `xrefs`                 | one row per non-call reference (reads, writes, jumps, data) |
+| `strings`               | one row per defined string in loaded memory    |
+| `ground_truth_functions`| one row per `nm -S` T/t symbol (regression signal) |
+
+All six are auto-discovered as DuckDB views by `scripts/query`. The
+warehouse is a tree of Parquet files, not an embedded DB file
+(see `notes/design-decisions.md` §D15).
+
+### Targets currently in the warehouse
+
+| target                   | ISA         | build            | notes                          |
+|--------------------------|-------------|------------------|--------------------------------|
+| `pico_blinky`            | Cortex-M0+  | Pico SDK, -O3, newlib   | 84 fn, 90 calls, 474 bb, 848 xrefs, 9 strings |
+| `zephyr_hello_world`     | Cortex-M3   | Zephyr, -Os, picolibc   | 110 fn, 154 calls, 619 bb, 970 xrefs, 42 strings |
+| `zephyr_synchronization` | Cortex-M3   | Zephyr, -Os, picolibc   | 130 fn, ~200 calls, larger bb/xref counts      |
+
+The two Zephyr targets share a build config; Pico does not.
+
+### Key empirical findings (newest first)
+
+1. **Structural fingerprinting works at ~96% cluster-level precision
+   under same-build conditions.** Strict 8-tuple signature match
+   between `zephyr_hello_world` and `zephyr_synchronization` finds
+   75 shared function signatures; 72 of them have identical names
+   across both targets. The matches span the real Zephyr kernel
+   (vfprintf, z_thread_abort, skip_to_arg, z_add_timeout,
+   sys_clock_announce, k_sched_unlock, z_arm_fatal_error, …), not
+   noise. See `notes/fingerprinting-baseline.md`.
+
+2. **"Same toolchain" is too weak a hypothesis for cross-target
+   matching.** Pico and Zephyr targets share `arm-none-eabi-gcc
+   15.2.1` but match almost nothing structurally because they differ
+   on ISA (armv6s-m vs armv7-m), optimization level (-O3 vs -Os),
+   libc (newlib vs picolibc), and link surface. The correct
+   hypothesis is "matching (ISA, -O, libc, link surface)." This
+   validates design-decision D9 (train embeddings on P-Code, not
+   disassembly) from the empirical side.
+
+3. **Ghidra's extraction is 100% complete with respect to real
+   function bodies on both test ISAs.** The ground-truth nm
+   coverage query shows 68.8% raw match on Pico and 97.0% on
+   Zephyr; the gap is entirely explained by non-function nm symbols
+   (section boundary markers, pre_init pointer tables, RAM-resident
+   data with text-like section flags, weak handlers stripped by the
+   linker). Extractor behavior is target-agnostic; raw coverage
+   percentage is a property of the target's symbol-table discipline.
+   See `notes/ghidra-extraction-notes.md`.
+
+4. **Parquet-as-truth storage was the right call.** Adding targets
+   is config-only (zero code changes), Snakemake caching is exact
+   per (target, table) tuple, failed ingests leave no output behind.
+   See design-decisions §D15.
+
+### Current session's recommended next move
+
+**Close the 3-of-75 within-target collision gap in the structural
+signature query.** Two orthogonal fixes, both cheap:
+
+- **Name-aware post-processing** in `structural_signatures.sql`:
+  split clusters with multiple distinct names into per-name
+  sub-clusters. Pure SQL, ~10 minutes, takes cluster-level precision
+  to ~100% on named pairs.
+- **Byte-pattern hash column** in the `functions` table. Small
+  extractor change (`func.getBody()` → read bytes → SHA-1 →
+  store), closes the within-target twins gap. One new column in
+  `schemas.py`.
+
+After that, the natural next step is the Phase 1 reference corpus:
+compile FreeRTOS for `cortex-m0plus -O3` to match the Pico build
+config, drop it in as a ripcord target, and demonstrate first
+external library-ID against a future Pico-FreeRTOS target.
+
+Deferred but important: write `notes/confidence-scheme.md` before
+any table gains a `confidence` column. And eventually
+`export_pcode.py` for the ISA-invariant path to cross-ISA
+fingerprinting.
 
 ## Non-goals and constraints (read carefully)
 
@@ -116,30 +188,52 @@ If you need more context than this file provides, read in this
 priority order. Each file is dense but self-contained — you do not
 need to read everything.
 
-1. [`notes/README.md`](./notes/README.md) — index and thesis summary.
-2. [`notes/goal-and-approach.md`](./notes/goal-and-approach.md) — why
+Findings and design log (read first — these reflect current state):
+
+1. [`notes/design-decisions.md`](./notes/design-decisions.md) —
+   chronological log of architectural choices and their reasoning.
+   Check this before proposing anything that revisits a prior
+   decision. D15/D16/D17 are the current-session decisions you are
+   most likely to need to reference.
+2. [`notes/fingerprinting-baseline.md`](./notes/fingerprinting-baseline.md)
+   — the empirical Phase 1 baseline result. 96% structural match
+   precision under same-build conditions, essentially zero match
+   under mismatched build conditions, and what both findings mean
+   for the corpus build plan.
+3. [`notes/ghidra-extraction-notes.md`](./notes/ghidra-extraction-notes.md)
+   — what Ghidra captures, what it correctly omits, calibrated
+   against `nm` ground truth on both Pico and Zephyr targets. Read
+   this before worrying about any extractor coverage number in
+   isolation.
+4. [`notes/PLAN.md`](./notes/PLAN.md) — phased roadmap. Phase 0
+   done, Stage 0 wide, Phase 1 rule-based fingerprinting partially
+   validated. Open questions list updated.
+
+Design and architecture (read when reasoning about structure):
+
+5. [`notes/README.md`](./notes/README.md) — index and thesis summary.
+6. [`notes/goal-and-approach.md`](./notes/goal-and-approach.md) — why
    the artifact is a database, not code.
-3. [`notes/pipeline-architecture.md`](./notes/pipeline-architecture.md)
+7. [`notes/pipeline-architecture.md`](./notes/pipeline-architecture.md)
    — pipeline stages, warehouse model, blackboard.
-4. [`notes/PLAN.md`](./notes/PLAN.md) — phased roadmap, current
-   status is Phase 0 scaffolded but not executed.
-5. [`notes/design-decisions.md`](./notes/design-decisions.md) —
-   chronological log of major architectural choices and their
-   reasoning. Check this before proposing anything that revisits a
-   prior decision.
-6. [`notes/tooling.md`](./notes/tooling.md) — reference sheet for
+
+Reference material (read on demand):
+
+8. [`notes/tooling.md`](./notes/tooling.md) — reference sheet for
    every tool involved and when to reach for it.
-7. [`notes/prior-art.md`](./notes/prior-art.md) — adjacent communities
+9. [`notes/prior-art.md`](./notes/prior-art.md) — adjacent communities
    and what to learn from them. N64 decomp scene and Asahi Linux are
    the most relevant references.
-8. [`notes/test-corpus-and-validation.md`](./notes/test-corpus-and-validation.md)
-   — validation methodology, test-difficulty ramp, open-source
-   hardware targets.
-9. [`notes/fingerprinting.md`](./notes/fingerprinting.md) and
-   [`notes/local-ml-fingerprinting.md`](./notes/local-ml-fingerprinting.md)
-   — multi-signal function classification research thread (rules
-   first, learned model later).
-10. [`notes/use-cases-and-strategy.md`](./notes/use-cases-and-strategy.md)
+10. [`notes/test-corpus-and-validation.md`](./notes/test-corpus-and-validation.md)
+    — validation methodology, test-difficulty ramp, open-source
+    hardware targets.
+11. [`notes/fingerprinting.md`](./notes/fingerprinting.md) and
+    [`notes/local-ml-fingerprinting.md`](./notes/local-ml-fingerprinting.md)
+    — multi-signal function classification research thread (rules
+    first, learned model later). The *empirical* Phase 1 status
+    lives in `fingerprinting-baseline.md`; these two are the
+    research design docs the baseline grew out of.
+12. [`notes/use-cases-and-strategy.md`](./notes/use-cases-and-strategy.md)
     — market landscape, open-source-vs-paid shape, honest framing
     about niche size.
 
@@ -164,6 +258,12 @@ scripts/query
 # Interactive DuckDB REPL with all tables pre-loaded as views
 scripts/query --repl
 
+# Run a committed multi-statement query file
+scripts/query < notes/queries/coverage.sql
+scripts/query < notes/queries/stage0_complete.sql
+scripts/query < notes/queries/structural_signatures.sql
+scripts/query < notes/queries/cross_target.sql
+
 # Clean all pipeline outputs (regeneratable)
 snakemake clean
 # or: rm -rf build/
@@ -176,37 +276,77 @@ All three environment variables (`GHIDRA_PYGHIDRA`, `JAVA_HOME`,
 `PYTHON`) are persisted in `~/.zshrc`. See `SETUP.md` for what they
 should point to on a fresh machine.
 
+## Committed queries (executable documentation)
+
+`notes/queries/` holds SQL files that are both tests and reference
+examples. Each file has a header comment explaining what it does
+and why. Run any of them with `scripts/query < notes/queries/<file>.sql`.
+
+| file                         | what it does                                                  |
+|------------------------------|---------------------------------------------------------------|
+| `coverage.sql`               | Ground-truth coverage (`functions` vs `ground_truth_functions`), bucketed by symbol category. Regression signal for extractor health. |
+| `calls_sanity.sql`           | Call graph invariants, top fan-in/fan-out, recursive CTE reachability from `main`. |
+| `stage0_complete.sql`        | Cross-table demonstration that all five Stage 0 tables work together. Includes string-based naming candidates and basic-block consistency check. |
+| `cross_target.sql`           | First multi-target joins: row-count matrix, shared function names, side-by-side coverage. |
+| `structural_signatures.sql`  | Phase 1 rule-based fingerprinting baseline. Computes per-function feature vectors and finds cross-target structural matches. See `notes/fingerprinting-baseline.md` for the interpretation. |
+
+When you discover a query that's worth keeping, add it here as a
+new `.sql` file with a clear header comment. These files double as
+regression tests — if a future extractor change breaks one, you
+want to know immediately.
+
 ## Repository layout
 
 ```
 ripcord/
-├── CLAUDE.md                         (this file)
+├── CLAUDE.md                         (this file — project orientation)
 ├── README.md                         (human-facing project overview)
 ├── SETUP.md                          (toolchain prerequisites)
 ├── Snakefile                         (pipeline DAG)
-├── config.yaml                       (target binary list)
+├── config.yaml                       (target binary list, arch per target)
 ├── .gitignore
 ├── notes/                            (design notes, authoritative)
 │   ├── README.md
 │   ├── goal-and-approach.md
 │   ├── pipeline-architecture.md
 │   ├── PLAN.md
-│   ├── design-decisions.md
+│   ├── design-decisions.md           (append-only; D1-D17 current)
 │   ├── tooling.md
 │   ├── prior-art.md
 │   ├── test-corpus-and-validation.md
-│   ├── fingerprinting.md
-│   ├── local-ml-fingerprinting.md
-│   └── use-cases-and-strategy.md
+│   ├── fingerprinting.md             (research design, rule-based)
+│   ├── local-ml-fingerprinting.md    (research design, learned)
+│   ├── fingerprinting-baseline.md    (EMPIRICAL current state of Phase 1)
+│   ├── ghidra-extraction-notes.md    (calibrated extractor findings)
+│   ├── use-cases-and-strategy.md
+│   └── queries/                      (committed SQL, executable docs)
+│       ├── coverage.sql
+│       ├── calls_sanity.sql
+│       ├── stage0_complete.sql
+│       ├── cross_target.sql
+│       └── structural_signatures.sql
 ├── scripts/
 │   ├── query                         (SQL over build/*/tables/*.parquet)
 │   ├── ghidra/
-│   │   └── export_functions.py       (PyGhidra extraction)
+│   │   ├── export_functions.py       (PyGhidra: functions table)
+│   │   ├── export_calls.py           (PyGhidra: calls table)
+│   │   ├── export_basic_blocks.py    (PyGhidra: basic_blocks table)
+│   │   ├── export_xrefs.py           (PyGhidra: non-call xrefs)
+│   │   └── export_strings.py         (PyGhidra: defined strings, loaded-memory filtered)
 │   └── ingest/
-│       └── load_functions.py         (JSONL → Parquet, schema inline)
+│       ├── schemas.py                (pyarrow schemas + row transforms per table)
+│       ├── load_table.py             (generic JSONL → Parquet loader)
+│       └── load_ground_truth.py      (nm -S → Parquet, regression signal)
 └── targets/                          (test binaries, gitignored)
-    └── README.md                     (build instructions)
+    └── README.md                     (build instructions per target)
 ```
+
+Every extractor, loader, and schema follows the same pattern: one
+file per concern, no surprise couplings, the `Snakefile` is the
+only place that knows how they compose. Adding a new table is
+three files: `export_<table>.py` (or extending an existing
+extractor), an entry in `schemas.py`, and an `ingest_<table>`
+rule in the `Snakefile`.
 
 ## How the user works and what they expect from Claude
 

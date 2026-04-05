@@ -90,6 +90,32 @@ snakemake --version
   phase. `pip install angr`.
 - **Soufflé** — Datalog engine for the fact derivation layer. Later
   phase.
+- **west + Zephyr workspace** — required if you want to build any
+  Zephyr sample target (e.g. `zephyr_hello_world`,
+  `zephyr_synchronization`). See `targets/README.md` for the full
+  Zephyr build path. Short version:
+
+  ```bash
+  # Install west into the pipeline venv
+  source ~/.venvs/ripcord/bin/activate
+  pip install west
+
+  # Initialize the Zephyr workspace (~8 GB after update)
+  cd ~
+  west init -m https://github.com/zephyrproject-rtos/zephyr zephyrproject
+  cd ~/zephyrproject
+  west update                                              # ~5-10 min
+  pip install -r zephyr/scripts/requirements-base.txt
+
+  # Use the existing arm-none-eabi-gcc via the gnuarmemb toolchain
+  # variant — no Zephyr SDK download needed.
+  export ZEPHYR_TOOLCHAIN_VARIANT=gnuarmemb
+  export GNUARMEMB_TOOLCHAIN_PATH=/Applications/ArmGNUToolchain/15.2.rel1/arm-none-eabi
+  ```
+
+  The `GNUARMEMB_TOOLCHAIN_PATH` path will differ if you have a
+  different `arm-none-eabi-gcc` version from Homebrew; the pattern
+  is `/Applications/ArmGNUToolchain/<version>/arm-none-eabi`.
 
 ## Environment variables
 

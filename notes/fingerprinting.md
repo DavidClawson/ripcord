@@ -2,6 +2,21 @@
 
 A research thread, not strictly required for v1 of the pipeline, but
 potentially the highest-leverage auxiliary capability we could build.
+
+> **Status update (2026-04-05):** the rule-based structural
+> fingerprinting baseline described in this file has been
+> implemented as `notes/queries/structural_signatures.sql` and
+> validated end-to-end. It hits **~96% cluster-level precision**
+> on two Zephyr targets with matching build configs and essentially
+> zero useful matches on target pairs with mismatched build configs
+> (different ISA, -O level, libc, or link surface). The empirical
+> write-up lives in `notes/fingerprinting-baseline.md`; that file
+> is the authoritative "current state" for Phase 1 fingerprinting.
+> The research thread below is still the reference for *why* the
+> technique works and *what comes after* the SQL baseline (learned
+> models, multi-signal classifiers, the self-improving corpus
+> loop). Design decision D18 records the corpus build-matrix
+> constraint that came out of this validation.
 Goal: given an unknown function in a stripped firmware binary, classify
 it — "this is the FreeRTOS scheduler," "this is an STM32 HAL UART
 wrapper," "this is SHA-256," "this is application logic" — without
@@ -276,6 +291,45 @@ For cord specifically:
 That's maybe a week of work and probably identifies 50-80% of the
 binary. Every subsequent phase (agents, Datalog, Unicorn verification)
 runs on a warehouse where most of the noise is already labeled.
+
+## Validation of the cheap-start thesis (2026-04-05)
+
+The "cheap start" section above predicted that rule-based structural
+matching alone would catch a large fraction of library code without
+any ML infrastructure. That prediction has now been validated on
+real data:
+
+- Two Zephyr targets built with the same toolchain (`arm-none-eabi-gcc
+  15.2.1`, `-Os`, picolibc) for the same board (`qemu_cortex_m3`)
+  share ~96% of their function signatures under a hand-crafted
+  8-tuple feature vector `(size, blocks, instructions,
+  outgoing_calls, distinct_callees, reads, writes, jumps)`.
+- 72 of 75 cross-target signature clusters have matching function
+  names across both targets — direct evidence that the matches are
+  semantically real, not structurally coincidental.
+- The matches are the substantive kernel, not tiny stubs: vfprintf
+  (1278 bytes, 158 blocks), z_thread_abort, skip_to_arg,
+  z_add_timeout, sys_clock_announce, k_sched_unlock, z_arm_fatal_error,
+  z_cstart, and dozens of others.
+
+What the baseline **does not** catch:
+
+1. Cross-ISA matches (Cortex-M0+ vs Cortex-M3). These require
+   ISA-invariant features — see `local-ml-fingerprinting.md` and
+   design-decision D9 for the P-Code approach.
+2. Cross-`-O` matches. Same code compiled at -O0 vs -O3 produces
+   different block counts and instruction counts; the feature
+   vector needs augmentation or normalization.
+3. Within-target structural twins (functions in the same binary
+   with identical `(size, blocks, instructions, …)` counts but
+   different semantics). ~3 in 75 on Zephyr. A byte-pattern hash
+   column on the `functions` table closes this gap cheaply.
+
+The overall prediction holds: the cheap rule-based path is
+genuinely enough to get 60-80% coverage of library code under
+matching-build conditions, with zero ML. The research extensions
+below remain the path for what the SQL baseline can't do — the
+fuzzy middle between exact matches and totally opaque functions.
 
 ## The narrow "FreeRTOS vs HAL vs crypto" question
 
