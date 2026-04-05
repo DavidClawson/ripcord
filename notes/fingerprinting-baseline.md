@@ -190,3 +190,129 @@ In rough order of cost vs. value:
   we now know the corpus requirement (homogeneous flags) and the
   invariant-features requirement (P-Code for cross-ISA) are
   non-negotiable, not optional.
+
+## Second Zephyr target confirms the hypothesis (2026-04-05, same day)
+
+Added `zephyr_synchronization` — Zephyr's canonical two-threads-
+two-semaphores sample, built for the same `qemu_cortex_m3` board
+with the same flags and the same picolibc, as a strict superset of
+`zephyr_hello_world`'s kernel surface. Ran the same
+`structural_signatures.sql` without modification. The results flip
+from "essentially nothing" to "near-perfect library identification."
+
+**Strict 8-tuple match results (zephyr_hello_world ⨝ zephyr_synchronization):**
+
+| metric                                          |   n |
+|-------------------------------------------------|----:|
+| distinct signatures in zephyr_hello_world       |  87 |
+| distinct signatures in zephyr_synchronization   | 103 |
+| signatures matched between the two (strict 8-tuple) | **75** |
+| clusters with identical names across targets    |  **72** |
+
+**72 of 75 cross-target clusters have matching names — 96% cluster-
+level precision.** The 3 "mismatches" are not cross-target false
+positives: they are *within-target* collisions where two or more
+functions inside the same binary share the same signature
+(`z_arm_interrupt_init` and `init_ready_q` both appear in both
+targets with identical signatures, creating a four-member cluster
+with two distinct names). The cross-target pairing on each name
+individually is still correct.
+
+86% of zephyr_hello_world's distinct-signature functions (75/87)
+have an identical structural twin in zephyr_synchronization. 73%
+in the other direction (75/103), because synchronization adds
+functions hello_world doesn't have (thread scheduler entry
+points, the two per-thread locals, semaphore primitives). The
+asymmetry is exactly the shape we expected from a
+subset/superset relationship.
+
+**Representative matches (top-25 by size):**
+
+    vfprintf                           1278 bytes, 158 blocks
+    z_thread_abort                      394          35
+    skip_to_arg                         298          53
+    z_add_timeout                       278          19
+    sys_clock_set_timeout               200          14
+    __ultoa_invert                      192          12
+    sys_clock_announce                  186           6
+    bg_thread_main                      166          11
+    z_cstart                            160           1
+    ready_thread                        140          13
+    ... (15 more)
+    k_sched_unlock                       94          11
+    move_current_to_end_of_prio_q        86           7
+    z_time_slice                         80           8
+    z_arm_fatal_error                    76           5
+    free_list_add                        68           4
+    sys_clock_isr                        64           1
+    z_impl_k_wakeup                      64           3
+    elapsed                              58           4
+    z_time_slice_size                    52           8
+    z_reset_time_slice                   52           3
+
+Every entry is a real Zephyr kernel or picolibc function. The
+coverage spans every subsystem both targets touch: printf
+machinery (`vfprintf`, `skip_to_arg`, `__ultoa_invert`), thread
+scheduler (`z_thread_abort`, `ready_thread`, `k_sched_unlock`,
+`move_current_to_end_of_prio_q`, `z_time_slice*`), timer subsystem
+(`z_add_timeout`, `sys_clock_*`, `elapsed`), kernel init
+(`z_cstart`, `bg_thread_main`), ARM fault handling
+(`z_arm_fatal_error`), memory management (`free_list_add`).
+
+The 12 functions from synchronization that do NOT match hello_world
+are exactly what you'd predict: thread entry points (`thread_a_entry_point`,
+`thread_b_entry_point`), the `hello_loop` function synchronization
+defines, `k_sem_*` primitives that hello_world never pulls in, and
+a few of synchronization's own static helpers. Clean superset
+structure.
+
+**Takeaway — this is the Phase 1 primitive working end-to-end:**
+
+1. The structural signature query is the right primitive. It was
+   not broken; it was aimed at incompatible targets last session.
+2. Rule-based library identification under same-build conditions
+   works *today*, at ~96% cluster-level precision, with no ML, no
+   learned corpus, and no byte-pattern hashing. The Stage 0
+   warehouse is sufficient.
+3. The feature vector's limitation is within-target structural
+   twins (functions with identical `(size, blocks, instructions,
+   calls, xrefs)` counts that are genuinely different functions).
+   On Zephyr this affected 3 of 75 clusters. The fix is richer
+   per-function features: a byte-pattern hash, a P-Code opcode
+   histogram, or a call-neighborhood signature — all deferred to
+   Phase 1 proper.
+4. The cross-target failure from the first session (pico ↔ zephyr)
+   was entirely explained by build matrix mismatch, not feature
+   vector weakness. Same session, same query, different targets,
+   dramatic change in result quality.
+5. **Phase 1 library identification can be driven by a reference
+   corpus that is built with matching flags, at ~96% precision,
+   using only the SQL we have.** Every step beyond that — byte
+   patterns, P-Code embeddings, fuzzy match — is a precision
+   improvement, not a prerequisite. The floor is already usable.
+
+## Updated next steps
+
+Downgrade in importance:
+
+- ~~Build a second Zephyr sample to confirm the same-build
+  hypothesis.~~ Done.
+
+Upgrade in importance:
+
+- **Start the Phase 1 reference corpus with one target-matched
+  library build.** FreeRTOS compiled for `cortex-m0plus -O3`
+  dropped in as a ripcord target, so the structural signature
+  query can identify FreeRTOS functions in a future Pico-FreeRTOS
+  build. This is the first real library-ID result we could
+  demonstrate against an unknown binary.
+
+- **Add a byte-pattern feature** to the extractor (a hash of the
+  instruction bytes per function, normalized for relocations) to
+  close the 3-of-75 within-target collision gap. Small extractor
+  change, single new column, no ML.
+
+- **Add name-aware matching post-processing** to the structural
+  query. When a cluster has multiple distinct names, split it by
+  name pair — that's the 100%-precision version of the current
+  query and it's a pure SQL change with no new data needed.

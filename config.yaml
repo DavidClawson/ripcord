@@ -20,6 +20,12 @@ targets:
     arch: arm
     source: "zephyrproject/zephyr/samples/hello_world"
 
+  zephyr_synchronization:
+    elf: targets/zephyr_synchronization/zephyr.elf
+    description: "Zephyr synchronization sample (two threads, semaphores) on qemu_cortex_m3"
+    arch: arm
+    source: "zephyrproject/zephyr/samples/synchronization"
+
   # Uncomment and add entries as you build more targets.
   #
   # pico_freertos_blinky:
