@@ -34,8 +34,11 @@ REPO_ROOT = Path(workflow.basedir).resolve()
 
 rule all:
     input:
-        expand("build/{target}/tables/functions.parquet", target=TARGETS),
-        expand("build/{target}/tables/calls.parquet", target=TARGETS),
+        expand("build/{target}/tables/functions.parquet",    target=TARGETS),
+        expand("build/{target}/tables/calls.parquet",        target=TARGETS),
+        expand("build/{target}/tables/basic_blocks.parquet", target=TARGETS),
+        expand("build/{target}/tables/xrefs.parquet",        target=TARGETS),
+        expand("build/{target}/tables/strings.parquet",      target=TARGETS),
         expand("build/{target}/tables/ground_truth_functions.parquet", target=TARGETS),
 
 
@@ -57,14 +60,20 @@ rule ghidra_extract:
     input:
         elf = lambda wc: config["targets"][wc.target]["elf"],
     output:
-        functions_jsonl = "build/{target}/functions.jsonl",
-        calls_jsonl = "build/{target}/calls.jsonl",
+        functions_jsonl    = "build/{target}/functions.jsonl",
+        calls_jsonl        = "build/{target}/calls.jsonl",
+        basic_blocks_jsonl = "build/{target}/basic_blocks.jsonl",
+        xrefs_jsonl        = "build/{target}/xrefs.jsonl",
+        strings_jsonl      = "build/{target}/strings.jsonl",
     params:
         project_dir = lambda wc: f"build/{wc.target}/ghidra_project",
         project_name = lambda wc: wc.target,
         script_path = str(REPO_ROOT / "scripts" / "ghidra"),
-        functions_out = lambda wc: str((REPO_ROOT / f"build/{wc.target}/functions.jsonl").resolve()),
-        calls_out = lambda wc: str((REPO_ROOT / f"build/{wc.target}/calls.jsonl").resolve()),
+        functions_out    = lambda wc: str((REPO_ROOT / f"build/{wc.target}/functions.jsonl").resolve()),
+        calls_out        = lambda wc: str((REPO_ROOT / f"build/{wc.target}/calls.jsonl").resolve()),
+        basic_blocks_out = lambda wc: str((REPO_ROOT / f"build/{wc.target}/basic_blocks.jsonl").resolve()),
+        xrefs_out        = lambda wc: str((REPO_ROOT / f"build/{wc.target}/xrefs.jsonl").resolve()),
+        strings_out      = lambda wc: str((REPO_ROOT / f"build/{wc.target}/strings.jsonl").resolve()),
     shell:
         r"""
         mkdir -p {params.project_dir} $(dirname {output.functions_jsonl})
@@ -72,10 +81,16 @@ rule ghidra_extract:
             -import {input.elf} \
             -overwrite \
             -scriptPath {params.script_path} \
-            -postScript export_functions.py {params.functions_out} \
-            -postScript export_calls.py     {params.calls_out}
+            -postScript export_functions.py     {params.functions_out} \
+            -postScript export_calls.py         {params.calls_out} \
+            -postScript export_basic_blocks.py  {params.basic_blocks_out} \
+            -postScript export_xrefs.py         {params.xrefs_out} \
+            -postScript export_strings.py       {params.strings_out}
         test -s {output.functions_jsonl}
         test -s {output.calls_jsonl}
+        test -s {output.basic_blocks_jsonl}
+        test -s {output.xrefs_jsonl}
+        test -s {output.strings_jsonl}
         """
 
 
@@ -105,6 +120,54 @@ rule ingest_calls:
         r"""
         {PYTHON} scripts/ingest/load_table.py \
             --table calls \
+            --source {wildcards.target} \
+            --output {output.parquet} \
+            {input.jsonl}
+        """
+
+
+rule ingest_basic_blocks:
+    """Load one target's basic-block JSONL into a typed Parquet table."""
+    input:
+        jsonl = "build/{target}/basic_blocks.jsonl",
+    output:
+        parquet = "build/{target}/tables/basic_blocks.parquet",
+    shell:
+        r"""
+        {PYTHON} scripts/ingest/load_table.py \
+            --table basic_blocks \
+            --source {wildcards.target} \
+            --output {output.parquet} \
+            {input.jsonl}
+        """
+
+
+rule ingest_xrefs:
+    """Load one target's non-call xref JSONL into a typed Parquet table."""
+    input:
+        jsonl = "build/{target}/xrefs.jsonl",
+    output:
+        parquet = "build/{target}/tables/xrefs.parquet",
+    shell:
+        r"""
+        {PYTHON} scripts/ingest/load_table.py \
+            --table xrefs \
+            --source {wildcards.target} \
+            --output {output.parquet} \
+            {input.jsonl}
+        """
+
+
+rule ingest_strings:
+    """Load one target's defined-string JSONL into a typed Parquet table."""
+    input:
+        jsonl = "build/{target}/strings.jsonl",
+    output:
+        parquet = "build/{target}/tables/strings.parquet",
+    shell:
+        r"""
+        {PYTHON} scripts/ingest/load_table.py \
+            --table strings \
             --source {wildcards.target} \
             --output {output.parquet} \
             {input.jsonl}

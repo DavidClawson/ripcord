@@ -134,6 +134,34 @@ previously-explained missing address to reappear on the gap list, or
 a previously-extracted Ghidra function to disappear, that is a
 regression worth investigating.
 
+## Debug-section strings in export_strings.py (2026-04-04)
+
+On the first Step 3 run, `export_strings.py` emitted **334 strings**
+for Pico blinky, of which only **9 were in loaded flash**
+(0x10000000+). The other 325 were DWARF `.debug_str` / `.comment`
+entries that Ghidra loads into overlay address spaces at very low
+addresses (0x0 to ~0x1950) — toolchain metadata, compilation unit
+names, source paths, the GCC banner, local variable names, etc.
+
+Fix: `export_strings.py` now filters via
+`program.getMemory().getLoadedAndInitializedAddressSet().contains(addr)`
+before checking `StringDataInstance.isString`. Only strings that
+live in the binary's runtime memory image get emitted.
+
+This filter is the right default for every extractor that walks
+listing data program-wide. `export_functions.py` and
+`export_basic_blocks.py` are already implicitly safe because they
+iterate FunctionManager and BasicBlockModel respectively, both of
+which only return results from loaded code. `export_xrefs.py` and
+`export_calls.py` iterate from within function bodies, which are
+also loaded by construction. Only program-wide data iteration
+(strings, and any future extractor that walks `getDefinedData` or
+the full Listing) needs the explicit filter.
+
+If a future target shows a suspicious jump in strings row count,
+the first check is whether the new strings are in loaded memory or
+in debug overlays.
+
 ## Next targets
 
 When adding a second target (Zephyr, STM32, AVR), rerun the coverage
