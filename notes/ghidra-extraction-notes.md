@@ -162,10 +162,64 @@ If a future target shows a suspicious jump in strings row count,
 the first check is whether the new strings are in loaded memory or
 in debug overlays.
 
+## Zephyr hello_world on qemu_cortex_m3 (2026-04-05)
+
+Second target added. Coverage is dramatically cleaner than Pico:
+
+| metric                     | pico_blinky | zephyr_hello_world |
+|----------------------------|-----------:|-------------------:|
+| nm unique addresses        |         96 |                100 |
+| Ghidra functions           |         84 |                110 |
+| agreement by address       |         66 |                 97 |
+| only in nm                 |         30 |                  3 |
+| only in Ghidra             |         18 |                 13 |
+| coverage %                 |       68.8 |               97.0 |
+
+The 3 "only in nm" unique addresses on Zephyr (6 raw rows including
+aliases) are the same categories we saw on Pico, smaller in number:
+
+- Section/region boundary markers: `__rodata_region_start`,
+  `__text_region_end`, `__rom_start_address`, `_vector_start`,
+  `_vector_table` — zero-size labels at link-script boundaries.
+- `_irq_vector_table` (172 bytes) at 0x40 — the ARM Cortex-M
+  interrupt vector table. It's a data structure of function
+  pointers, not a function body, so Ghidra correctly doesn't create
+  a Function object for it. The individual handler functions it
+  points at *are* in the Ghidra extraction; the table itself is
+  metadata about where they live.
+
+So the 97% coverage number is real: Zephyr's picolibc-linked
+hello_world has essentially no non-function text symbols, so the
+raw nm vs Ghidra count comparison is much closer to meaningful on
+this target than it was on Pico.
+
+The 13 "only in Ghidra" functions on Zephyr are the same class of
+finding as on Pico — weak symbols the linker stripped, inline
+functions forced out-of-line, etc. Ghidra recovers them from DWARF.
+
+**Takeaway across both targets:** the extractor's behavior is
+identical; the raw coverage percentage difference is entirely a
+property of the target's symbol table discipline, not the
+extractor. Pico SDK ships with a lot of link-script labels and
+function-pointer tables declared in `.text` sections; Zephyr
+doesn't. For regression purposes, the useful invariant is still
+"the specific set of missing addresses should stay stable between
+pipeline runs for a given target," and that holds.
+
 ## Next targets
 
-When adding a second target (Zephyr, STM32, AVR), rerun the coverage
-query and categorize any new classes of missing addresses here. The
-Pico SDK has its own quirks (pre_init tables, runtime_init
-callbacks, linker-script label conventions) that may not generalize;
-Zephyr and vendor HALs will surface different ones.
+Future targets (FreeRTOS, Arduino AVR, ESP32 RISC-V) should rerun
+the coverage query via `scripts/query < notes/queries/coverage.sql`
+and add a short section here for any new category of missing
+symbol that turns up. The categories we've seen so far are:
+
+- Section boundary markers (present on every link-script-based
+  ELF; Ghidra correctly omits them)
+- Function pointer tables (Pico's pre_init, Zephyr's IRQ vector
+  table — different shapes, same non-function-ness)
+- Data objects in text-flagged sections (Pico SDK quirk)
+- RAM-resident symbols marked T because of Pico linker script
+  (may or may not appear on other targets)
+- Weak-default handlers the linker strips (appear as "only in
+  Ghidra" because DWARF preserves the names even when the symbol
+  table doesn't)

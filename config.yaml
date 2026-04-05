@@ -14,16 +14,17 @@ targets:
     arch: arm
     source: "pico-sdk/src/rp2_common/pico_blink"
 
+  zephyr_hello_world:
+    elf: targets/zephyr_hello_world/zephyr.elf
+    description: "Zephyr hello_world sample on qemu_cortex_m3 (TI LM3S6965)"
+    arch: arm
+    source: "zephyrproject/zephyr/samples/hello_world"
+
   # Uncomment and add entries as you build more targets.
   #
   # pico_freertos_blinky:
   #   elf: targets/pico_freertos_blinky/blink_freertos.elf
   #   description: "Pico SDK + FreeRTOS blinky"
-  #   arch: arm
-  #
-  # zephyr_hello_world:
-  #   elf: targets/zephyr_hello_world/zephyr.elf
-  #   description: "Zephyr hello_world sample on qemu_cortex_m3"
   #   arch: arm
   #
   # arduino_uno_blink:
