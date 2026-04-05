@@ -69,20 +69,87 @@ def print_table_summary(tables: dict[str, list[str]]) -> None:
         )
 
 
+def split_statements(sql: str) -> list[str]:
+    """Split a SQL string on top-level semicolons.
+
+    Handles `--` line comments and single/double-quoted string literals
+    so apostrophes inside comments (e.g. "nm's output") don't confuse
+    the splitter. Not a full SQL parser — does not handle /* */ block
+    comments or dollar-quoted strings, neither of which appear in the
+    query files we commit.
+    """
+    statements: list[str] = []
+    buf: list[str] = []
+    in_single = False
+    in_double = False
+    in_line_comment = False
+    i = 0
+    n = len(sql)
+    while i < n:
+        ch = sql[i]
+        if in_line_comment:
+            buf.append(ch)
+            if ch == "\n":
+                in_line_comment = False
+            i += 1
+            continue
+        if (
+            not in_single
+            and not in_double
+            and ch == "-"
+            and i + 1 < n
+            and sql[i + 1] == "-"
+        ):
+            in_line_comment = True
+            buf.append(ch)
+            i += 1
+            continue
+        if ch == "'" and not in_double:
+            in_single = not in_single
+        elif ch == '"' and not in_single:
+            in_double = not in_double
+        elif ch == ";" and not in_single and not in_double:
+            stmt = "".join(buf).strip()
+            if stmt:
+                statements.append(stmt)
+            buf = []
+            i += 1
+            continue
+        buf.append(ch)
+        i += 1
+    tail = "".join(buf).strip()
+    if tail:
+        statements.append(tail)
+    return statements
+
+
 def run_query(tables: dict[str, list[str]], query: str) -> int:
     import duckdb  # lazy import so --repl path doesn't require it
 
     conn = duckdb.connect(":memory:")
     for stmt in view_ddl(tables):
         conn.execute(stmt)
-    try:
-        result = conn.sql(query)
-    except duckdb.Error as exc:
-        print(f"query error: {exc}", file=sys.stderr)
-        return 1
-    if result is not None:
-        print(result)
-    return 0
+
+    statements = split_statements(query)
+    if not statements:
+        return 0
+
+    rc = 0
+    for idx, stmt in enumerate(statements):
+        try:
+            result = conn.sql(stmt)
+        except duckdb.Error as exc:
+            print(f"query error in statement {idx + 1}: {exc}", file=sys.stderr)
+            rc = 1
+            continue
+        if result is not None:
+            if len(statements) > 1:
+                # Label each result set when there's more than one, so
+                # multi-statement query files produce legible output.
+                first_line = stmt.splitlines()[0][:70]
+                print(f"-- [{idx + 1}] {first_line}", file=sys.stderr)
+            print(result)
+    return rc
 
 
 def exec_repl(tables: dict[str, list[str]]) -> int:

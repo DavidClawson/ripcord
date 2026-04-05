@@ -34,6 +34,7 @@ REPO_ROOT = Path(workflow.basedir).resolve()
 rule all:
     input:
         expand("build/{target}/tables/functions.parquet", target=TARGETS),
+        expand("build/{target}/tables/ground_truth_functions.parquet", target=TARGETS),
 
 
 rule ghidra_export:
@@ -78,6 +79,30 @@ rule ingest_functions:
             --source {wildcards.target} \
             --output {output.parquet} \
             {input.jsonl}
+        """
+
+
+rule ground_truth_functions:
+    """Extract ground-truth text symbols from the ELF via `nm -S`.
+
+    This is the Phase 0.6 validation loop, committed as a pipeline
+    rule so every run produces a coverage signal. Joined against the
+    Ghidra-derived `functions` table by address in
+    notes/queries/coverage.sql.
+    """
+    input:
+        elf = lambda wc: config["targets"][wc.target]["elf"],
+    output:
+        parquet = "build/{target}/tables/ground_truth_functions.parquet",
+    params:
+        arch = lambda wc: config["targets"][wc.target]["arch"],
+    shell:
+        r"""
+        {PYTHON} scripts/ingest/load_ground_truth.py \
+            --elf {input.elf} \
+            --arch {params.arch} \
+            --source {wildcards.target} \
+            --output {output.parquet}
         """
 
 
