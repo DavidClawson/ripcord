@@ -74,8 +74,11 @@ transactional writes and is the right tool for the coordination layer
 once an agent swarm exists. Using both, each for what it's good at,
 is better than compromising on one. See `pipeline-architecture.md`.
 
-**Status:** active. DuckDB is in place; SQLite coordination layer is
-deferred until the agent swarm phase.
+**Status:** revisited by D15. The two-warehouse split (analytical vs.
+coordination) and the DuckDB-as-query-engine choice survive; the
+specific decision to persist analytical data in a DuckDB *file* is
+reversed in favor of Parquet-as-truth. SQLite for coordination is
+unchanged.
 
 ## D4. JSONL intermediate format, not Parquet (for v1)
 
@@ -94,8 +97,11 @@ functions per target) the speed difference is negligible. Deferring
 Parquet keeps the initial setup friction low without foreclosing the
 option.
 
-**Status:** active. Revisit when a target binary pushes intermediate
-files over ~100 MB or when ingest time becomes noticeable.
+**Status:** revisited by D16. JSONL is still the Ghidra→ingest
+intermediate for Phase 0, but the reasoning has changed (the
+Ghidrathon-pyarrow premise is obsolete) and the decision is now
+scoped specifically to the extractor→ingest hop, not to the warehouse
+format.
 
 ## D5. Ghidrathon over bundled Jython 2
 
@@ -114,7 +120,10 @@ step and the ingest step. The one-time install cost is small; the
 ongoing cost of writing Jython 2 would be significant. See
 `SETUP.md`.
 
-**Status:** active.
+**Status:** superseded by D17. The decision to use Python 3 instead
+of Jython 2 stands; the specific choice of *Ghidrathon* as the
+delivery mechanism is obsolete because Ghidra 11.2+ ships PyGhidra
+natively.
 
 ## D6. Snakemake as the orchestrator
 
@@ -316,6 +325,160 @@ generalize only when you've written the same pattern three times"
 applies to the filesystem too. See `PLAN.md` "What NOT to do early".
 
 **Status:** active.
+
+## D15. Parquet-as-truth for the analytical warehouse (revisits D3)
+
+**Considered:** keeping the analytical warehouse as a monolithic
+`build/warehouse.duckdb` file (status quo from D3); switching to a
+tree of per-(target, table) Parquet files queried by DuckDB; a hybrid
+where DuckDB is the source of truth but periodically exports Parquet
+snapshots.
+
+**Decided:** Parquet files are the analytical warehouse. Layout:
+`build/<target>/tables/<table>.parquet`, one file per (target, table)
+tuple. There is no persistent `.duckdb` file. DuckDB remains the
+primary query engine, but it runs queries *over* the Parquet tree,
+not *from* a database file. A thin helper, `scripts/query`,
+discovers parquets and registers them as DuckDB views on each
+invocation. SQLite for coordination (D3's other half) is unchanged.
+
+**Reasoning:**
+
+- *Per-target isolation.* Regenerating one target touches only its
+  own parquet files. With a single DuckDB file, rebuilding one target
+  means deleting rows from every table in a shared file, which is
+  error-prone and racy once the pipeline runs in parallel.
+- *Exact Snakemake caching.* Parquet files have deterministic content
+  hashes. Snakemake can tell exactly which downstream rules need to
+  rerun after a change. A `.duckdb` file is one opaque binary blob —
+  any write to any table bumps its mtime and forces wide
+  invalidation. This is a direct contribution to the "minutes, not
+  days" constraint.
+- *Tool agnosticism where it will matter.* Fingerprinting Phase 2-3
+  feeds data into ML pipelines that want Arrow or Polars frames, not
+  DuckDB query results. With Parquet-as-truth, training data is
+  already in the right format and a notebook can
+  `pl.scan_parquet('build/**/functions.parquet')` directly.
+- *Columnar storage from day one at essentially zero query cost.*
+  DuckDB's Parquet reader is within a few percent of its native-table
+  reader for ripcord's row counts. The difference is noise relative
+  to the actual query cost.
+- *Failed writes leave no state behind.* D3 was revisited in part
+  because a failed ingest run left an empty `warehouse.duckdb` file
+  that fooled Snakemake into thinking everything was up-to-date. With
+  atomic per-file writes, failures leave no output and the next run
+  simply retries.
+- *Reproducibility.* A commit plus a set of parquet content hashes
+  pins the warehouse exactly. The mutable `.duckdb` file did not.
+
+**Tradeoffs accepted:**
+
+- *No DB-enforced PRIMARY KEY / FOREIGN KEY.* Parquet has no
+  constraint model. Invariants that matter (e.g. every `calls.callee`
+  resolves to a `functions.addr`) will be enforced by a validation
+  rule in the Snakefile once the first cross-table references exist.
+- *Slightly clunkier ad-hoc CLI.* `scripts/query 'SELECT ...'` or
+  `scripts/query --repl` replaces `duckdb build/warehouse.duckdb`.
+  The helper auto-discovers every table, so adding new tables
+  requires no changes to the helper.
+- *Schema evolution by convention.* The schema is defined in the
+  Python ingest scripts (pyarrow schemas) rather than in DDL. Adding
+  a column is "append, don't rename, don't change type"; DuckDB's
+  `read_parquet(..., union_by_name=true)` NULL-fills missing columns
+  in old files so old and new parquets coexist.
+
+**Timing:** made before widening Stage 0 in order to minimize churn.
+With one table and one ingest rule in place, the migration was ~half
+a day of work. Delayed until after Stage 0 widening (five tables,
+five ingest rules) it would have been 5× larger.
+
+**Status:** active. The former `build/warehouse.duckdb` file and the
+`schema/001_init.sql` DDL file are both removed; the latter is
+replaced by the pyarrow schema in `scripts/ingest/load_functions.py`.
+
+## D16. JSONL as the extractor→ingest intermediate (revisits D4)
+
+**Considered:** keeping JSONL (D4's choice); switching the extractor
+to write Parquet directly now that it runs under PyGhidra and can
+import pyarrow; writing directly into the warehouse from the
+extractor.
+
+**Decided:** keep JSONL as the per-target hop between the Ghidra
+extractor and the ingest script.
+
+**Reasoning:** D4's original reasoning leaned on *"Parquet requires
+pyarrow inside the Ghidrathon Python environment."* That premise is
+obsolete — PyGhidra runs under the project venv, which already has
+pyarrow (see D17). However, JSONL still wins on the merits for this
+specific hop:
+
+- *Debuggability.* A JSONL file can be `head`ed, `grep`ped, diffed
+  across runs, and eyeballed without tools. Parquet cannot.
+- *Extractor simplicity.* The Ghidra extractor only depends on the
+  standard library; no pyarrow import overhead on every run.
+- *Schema flexibility during early iteration.* While the extraction
+  surface is still churning, JSONL lets the extractor emit new fields
+  without a schema migration on the writer side. The ingest script
+  is the single place that enforces types.
+- *Performance is still irrelevant at this scale.* At tens of
+  thousands of functions per target, the JSONL→parquet conversion is
+  milliseconds. Parquet would only pay off on vastly larger data,
+  which is a later problem.
+
+The decision is now scoped specifically to the extractor→ingest hop.
+The *warehouse* format is Parquet (D15); the *extractor output*
+format is JSONL.
+
+**Status:** active. Revisit if extraction surface grows to the point
+where JSONL parse time is measurable, or if a future extractor needs
+to emit schema information the ingest script cannot reconstruct.
+
+## D17. PyGhidra (built-in) for Python 3 scripting, not Ghidrathon (revisits D5)
+
+**Considered:** continuing with Mandiant's Ghidrathon extension for
+CPython 3 inside Ghidra; switching to PyGhidra, which ships natively
+with Ghidra 11.2+ and claims `.py` script files at the JVM level via
+its `PyGhidraScriptProvider`.
+
+**Decided:** PyGhidra. The `pyghidraRun -H` launcher is used instead
+of `analyzeHeadless`; it is functionally `analyzeHeadless` wrapped in
+a Python 3 runtime. The `pyghidra` pip package is installed in the
+project venv, and `JAVA_HOME` is pointed at Homebrew's `openjdk@21`
+(a transitive dependency of `brew install ghidra`).
+
+**Reasoning:**
+
+- *Ghidrathon is redundant on modern Ghidra.* In 11.2+, Ghidra's own
+  `PyGhidraScriptProvider` claims `.py` files before any extension
+  gets a chance. A Ghidrathon install on Ghidra 12.x is dead weight —
+  the extension registers but its script provider never runs.
+- *No extension install step.* PyGhidra ships with Ghidra. The only
+  install is `pip install pyghidra` into the venv. No downloading
+  release zips, no matching extension versions to Ghidra versions,
+  no unzipping into `~/.config/ghidra/<version>/Extensions/`.
+- *Version tracking follows Ghidra directly.* PyGhidra's Python
+  bindings ship in the same release as Ghidra itself, so there is no
+  Ghidra-version × Ghidrathon-version matrix to maintain. A Ghidra
+  upgrade is a Ghidra upgrade.
+- *Discovered by failure mode.* Phase 0 was originally scaffolded
+  assuming Ghidrathon would handle the extraction script. The first
+  real pipeline run failed with `Ghidra was not started with
+  PyGhidra. Python is not available` — PyGhidra had claimed the
+  script but the launcher wasn't in PyGhidra mode. Fixing that
+  surfaced the obsolescence of D5.
+
+**Tradeoffs accepted:**
+
+- *`JAVA_HOME` must be set explicitly.* Unlike `analyzeHeadless`,
+  which has its own Java-detection logic, PyGhidra reads `JAVA_HOME`
+  directly and fails if it's missing or points at an incompatible
+  JDK. Documented in SETUP.md and committed to `~/.zshrc`.
+- *Ghidra 11.1 and earlier do not have PyGhidra.* Ripcord pins
+  Ghidra 11.2+ as a minimum. This is fine — there is no reason to
+  support older Ghidra versions on a fresh project.
+
+**Status:** active. Ghidrathon has been uninstalled and the Phase 0
+pipeline runs end-to-end under PyGhidra.
 
 ## How to use this log
 

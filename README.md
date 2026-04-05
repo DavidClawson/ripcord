@@ -39,12 +39,14 @@ applied to firmware: one command, binary in, structure out.
 
 ## Status
 
-**Design complete, Phase 0 scaffolding in progress.** The architecture
-is captured in [`notes/`](./notes/) across a dozen design documents.
-This repo now contains an initial Snakemake pipeline that runs Ghidra
-headless against a target binary, extracts function metadata via a
-Ghidrathon script, and ingests the results into a DuckDB warehouse.
-See [`notes/PLAN.md`](./notes/PLAN.md) for the phased roadmap.
+**Phase 0 complete.** The Snakemake pipeline runs Ghidra headless
+(via PyGhidra's `pyghidraRun -H`) against a target binary, extracts
+per-function metadata as JSONL, and writes it to typed Parquet files
+under `build/<target>/tables/`. DuckDB is the query engine over the
+Parquet tree — there is no persistent database file. See
+[`notes/PLAN.md`](./notes/PLAN.md) for the phased roadmap and
+[`notes/design-decisions.md`](./notes/design-decisions.md) §D15 for
+the rationale behind Parquet-as-truth.
 
 The first test target is a Raspberry Pi Pico SDK blinky example —
 Cortex-M0+, bare metal, known ground truth. Subsequent targets will
@@ -77,7 +79,7 @@ recommended reading order:
 ## Getting started
 
 See [`SETUP.md`](./SETUP.md) for toolchain prerequisites (Ghidra,
-Ghidrathon, Python 3.11+, Snakemake, DuckDB, and optionally the
+Python 3.11+ with `pyghidra`, Snakemake, DuckDB, and optionally the
 Pico SDK for building the first test target).
 
 Quick start once tools are installed:
@@ -89,8 +91,8 @@ cd targets && <build a blinky> && cd ..
 # Run the pipeline
 snakemake --cores 4
 
-# Query the warehouse
-duckdb build/warehouse.duckdb "SELECT source, name, size FROM functions ORDER BY size DESC LIMIT 10"
+# Query the warehouse (Parquet tables under build/<target>/tables/)
+scripts/query "SELECT source, name, size FROM functions ORDER BY size DESC LIMIT 10"
 ```
 
 ## Origin
@@ -117,14 +119,15 @@ authors.
 ```
 ripcord/
 ├── README.md              (this file)
+├── CLAUDE.md              (project orientation for Claude Code sessions)
 ├── SETUP.md               (toolchain prerequisites)
 ├── Snakefile              (pipeline definition)
 ├── config.yaml            (target binary list)
 ├── .gitignore
 ├── notes/                 (design notes)
 ├── scripts/
-│   ├── ghidra/            (Ghidrathon extraction scripts)
-│   └── ingest/            (DuckDB ingest scripts)
-├── schema/                (warehouse schema migrations)
+│   ├── query              (SQL over build/*/tables/*.parquet)
+│   ├── ghidra/            (PyGhidra extraction scripts)
+│   └── ingest/            (JSONL → Parquet ingest, schema inline)
 └── targets/               (test binaries, gitignored)
 ```

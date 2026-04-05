@@ -1,0 +1,135 @@
+#!/usr/bin/env python3
+"""Run a SQL query against the ripcord parquet warehouse.
+
+Discovers every parquet file under build/<target>/tables/<name>.parquet,
+groups them by table name, and registers one DuckDB view per table that
+unions all matching files (one row per (target, row) across targets).
+
+Usage
+-----
+    scripts/query 'SELECT * FROM functions LIMIT 5'
+    scripts/query < query.sql
+    scripts/query                 # list registered tables and exit
+    scripts/query --repl          # drop into an interactive duckdb REPL
+                                    with the views pre-loaded
+
+The views are named after the parquet file basenames, so adding a new
+table is just "write a new parquet under build/<target>/tables/" — no
+changes to this script required.
+"""
+
+from __future__ import annotations
+
+import argparse
+import glob
+import os
+import sys
+import tempfile
+from collections import defaultdict
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+
+
+def discover_tables() -> dict[str, list[str]]:
+    groups: dict[str, list[str]] = defaultdict(list)
+    pattern = str(REPO_ROOT / "build" / "*" / "tables" / "*.parquet")
+    for path in glob.glob(pattern):
+        name = os.path.splitext(os.path.basename(path))[0]
+        groups[name].append(path)
+    return {k: sorted(v) for k, v in sorted(groups.items())}
+
+
+def view_ddl(tables: dict[str, list[str]]) -> list[str]:
+    stmts: list[str] = []
+    for name, paths in tables.items():
+        paths_sql = ", ".join(f"'{p}'" for p in paths)
+        stmts.append(
+            f"CREATE OR REPLACE VIEW {name} AS "
+            f"SELECT * FROM read_parquet([{paths_sql}], union_by_name=true);"
+        )
+    return stmts
+
+
+def print_table_summary(tables: dict[str, list[str]]) -> None:
+    if not tables:
+        print(
+            "no parquet tables found under build/*/tables/ — "
+            "run `snakemake --cores 4` to populate the warehouse",
+            file=sys.stderr,
+        )
+        return
+    print("registered views:", file=sys.stderr)
+    for name, paths in tables.items():
+        targets = sorted({Path(p).parent.parent.name for p in paths})
+        print(
+            f"  {name:24s}  {len(paths)} file(s) across targets: "
+            f"{', '.join(targets)}",
+            file=sys.stderr,
+        )
+
+
+def run_query(tables: dict[str, list[str]], query: str) -> int:
+    import duckdb  # lazy import so --repl path doesn't require it
+
+    conn = duckdb.connect(":memory:")
+    for stmt in view_ddl(tables):
+        conn.execute(stmt)
+    try:
+        result = conn.sql(query)
+    except duckdb.Error as exc:
+        print(f"query error: {exc}", file=sys.stderr)
+        return 1
+    if result is not None:
+        print(result)
+    return 0
+
+
+def exec_repl(tables: dict[str, list[str]]) -> int:
+    stmts = view_ddl(tables)
+    with tempfile.NamedTemporaryFile(
+        "w", suffix=".sql", delete=False, prefix="ripcord_init_"
+    ) as f:
+        f.write("\n".join(stmts))
+        init_path = f.name
+    os.execvp("duckdb", ["duckdb", "-init", init_path])
+    return 0  # unreachable
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "--repl",
+        action="store_true",
+        help="drop into an interactive duckdb REPL with views pre-loaded",
+    )
+    parser.add_argument(
+        "query",
+        nargs="*",
+        help="SQL query (joined with spaces). "
+        "If omitted and stdin is a pipe, the query is read from stdin.",
+    )
+    args = parser.parse_args()
+
+    tables = discover_tables()
+
+    if args.repl:
+        return exec_repl(tables)
+
+    if args.query:
+        return run_query(tables, " ".join(args.query))
+
+    if not sys.stdin.isatty():
+        query = sys.stdin.read().strip()
+        if query:
+            return run_query(tables, query)
+
+    print_table_summary(tables)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

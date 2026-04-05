@@ -20,12 +20,16 @@ pipeline's static extraction.
 - **Program API** gives access to functions, basic blocks, call graph,
   xrefs, strings — everything you'd want for extraction.
 
-### Ghidrathon
+### PyGhidra (ships with Ghidra 11.2+)
 
-A Ghidra extension that replaces the ancient bundled Jython 2 with modern
-CPython 3. Makes Ghidra scripts sane to write and integrate with the rest
-of a Python-based pipeline. Use this instead of Jython for the extraction
-script.
+Ghidra's native CPython 3 scripting bridge. In 11.2+ it replaces
+both the ancient bundled Jython 2 and the older third-party
+Ghidrathon extension — Ghidra's built-in `PyGhidraScriptProvider`
+claims `.py` files at the JVM level, so any Python script run via
+`pyghidraRun -H` (analyzeHeadless under PyGhidra) gets a real
+Python 3 runtime with access to the project venv. Install with
+`pip install pyghidra`; no Ghidra extension to manage. See
+`design-decisions.md` §D17 for the migration away from Ghidrathon.
 
 ### BinExport
 
@@ -236,7 +240,7 @@ Not strictly needed for v1, but worth knowing about:
 
 For bootstrapping Stage 0 + Stage 2:
 
-1. Ghidra + Ghidrathon
+1. Ghidra (includes PyGhidra natively in 11.2+) + `pip install pyghidra`
 2. Renode (you already have it from the other project)
 3. Python 3.11+ with: `duckdb`, `sqlite3` (stdlib), `pyarrow`, `polars`,
    `snakemake`, `unicorn`, eventually `angr`

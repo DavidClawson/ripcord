@@ -1,11 +1,11 @@
 # ripcord — Ghidra function metadata export
 #
-# Ghidrathon script (Python 3) run by analyzeHeadless after auto-analysis.
-# Writes per-function metadata as JSON Lines to a path passed on the
-# command line.
+# Python 3 postScript run by `pyghidraRun -H` (analyzeHeadless launched
+# under PyGhidra) after auto-analysis completes. Writes per-function
+# metadata as JSON Lines to a path passed on the command line.
 #
 # Invoked by the Snakemake ghidra_export rule as:
-#   analyzeHeadless <project_dir> <project_name> \
+#   pyghidraRun -H <project_dir> <project_name> \
 #       -import <elf> \
 #       -overwrite \
 #       -scriptPath scripts/ghidra \
@@ -14,9 +14,9 @@
 # The current Ghidra program is available via `currentProgram`.
 # The script arguments are available via `getScriptArgs()`.
 #
-# Requires Ghidrathon to be installed and the Python environment it
-# points at to be usable (standard library is sufficient for this
-# script — no pyarrow/duckdb needed inside Ghidra).
+# Uses only the standard library on purpose — keeps the extractor
+# cheap to invoke and its output eyeballable as text. The ingest
+# script is where rows get typed and written to Parquet.
 
 import json
 import sys

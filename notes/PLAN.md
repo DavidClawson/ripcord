@@ -33,15 +33,22 @@ is attempted.
 - **SQLite** for the coordination layer (`tasks.db` or similar). Task
   queue, leases, contracts, evidence log, type proposals. Not needed
   in Phase 0 but reserved as a design decision.
-- **DuckDB** for the analytical layer (`warehouse.duckdb`). Functions,
-  basic blocks, P-Code instructions, MMIO events, register accesses,
-  derived facts. This is the single highest-leverage architectural
-  choice in the whole plan — the 10-100x analytical query speedup
-  over SQLite pays for itself on day one of real use.
+- **DuckDB as the analytical query engine, Parquet as the storage
+  format.** Per-(target, table) Parquet files under
+  `build/<target>/tables/`. Functions, basic blocks, P-Code
+  instructions, MMIO events, register accesses, derived facts. No
+  persistent `.duckdb` file; DuckDB is invoked ad hoc (via
+  `scripts/query`) to run queries over the Parquet tree. This is
+  the single highest-leverage architectural choice in the whole
+  plan — columnar storage plus a 10-100x analytical query speedup
+  over SQLite pays for itself on day one of real use. See
+  `design-decisions.md` §D15 for the reasoning behind Parquet-as-truth
+  vs. a single DuckDB file.
 - **Parquet or JSONL** as the intermediate format between pipeline
   stages. Ghidra dumps structured output; everything ingests from it.
-  JSONL is simpler to write from Ghidrathon (no pyarrow dependency
-  inside Ghidra); Parquet is faster once the volume grows. Start with
+  JSONL is simpler to write from the Ghidra extractor (standard
+  library only, eyeballable for debugging); Parquet is faster once
+  the volume grows. Start with
   JSONL.
 - First schema has just the `functions` table. Every other table is
   added by migration as later stages need them.
@@ -60,15 +67,15 @@ already has CMake installed.
 
 ### 0.4 Ghidra extraction (Stage 0)
 
-- Install Ghidrathon so scripts can be written in Python 3 (see
-  `SETUP.md`).
+- Ghidra 11.2+ ships PyGhidra natively; install the companion
+  `pyghidra` Python package into the pipeline venv (see `SETUP.md`).
 - The extraction script `scripts/ghidra/export_functions.py` dumps
   per-function metadata: address, size, name, is_thunk, num_params,
   calling convention, basic block count, signature.
 - Output format: JSONL, one file per target, in
   `build/<target>/functions.jsonl`.
 - The ingest script `scripts/ingest/load_functions.py` loads JSONL
-  into the DuckDB warehouse at `build/warehouse.duckdb`.
+  into a typed Parquet file at `build/<target>/tables/functions.parquet`.
 - Run it against the Pico blinky and confirm the function count
   matches the unstripped ELF's symbol table.
 
@@ -85,7 +92,7 @@ already has CMake installed.
 
 - After the pipeline runs, query the warehouse:
   ```bash
-  duckdb build/warehouse.duckdb \
+  scripts/query \
     "SELECT source, COUNT(*) AS functions FROM functions GROUP BY source"
   ```
 - Compare against ground truth from the unstripped ELF
@@ -93,9 +100,9 @@ already has CMake installed.
   should match or be very close.
 
 **Phase 0 exit criteria:** you can run `snakemake` from scratch and
-end up with a DuckDB warehouse containing function metadata for at
-least one test target. You can write a SQL query against it and get
-answers. The pipeline exists.
+end up with a tree of Parquet tables containing function metadata
+for at least one test target. You can write a SQL query against it
+(via `scripts/query`) and get answers. The pipeline exists.
 
 ### 0.7 Add a second test target
 
@@ -318,8 +325,9 @@ measurable and trending up.
 
 These are unresolved and will block later phases if left unanswered:
 
-1. **Python version, Ghidra version, Ghidrathon version matrix.** Lock
-   these at the start and document them in SETUP.md.
+1. **Python version, Ghidra version, `pyghidra`/`jpype1` version
+   matrix.** Lock these at the start and document them in SETUP.md.
+   (Ghidrathon is obsolete on Ghidra 11.2+; see D17.)
 2. **Renode platform baselines per target.** Most Cortex-M targets
    have upstream `.repl` files in the Renode repo; pick and document
    the baseline for each test target as it is added.

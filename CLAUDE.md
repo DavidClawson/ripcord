@@ -19,24 +19,25 @@ operation, applied to firmware.
 
 ## Current state (as of 2026-04-04)
 
-**Phase 0 scaffolding is committed and pushed to
-https://github.com/DavidClawson/ripcord (private) but has not been
-executed yet.** The Snakefile, config.yaml, DuckDB schema, Ghidra
-extraction script, and Python ingest script all exist on disk. Until
-someone installs Ghidrathon, builds a target ELF, and runs
-`snakemake`, the pipeline is theoretical.
+**Phase 0 is complete.** The pipeline runs end-to-end on the
+Raspberry Pi Pico SDK blinky example: Ghidra headless (via PyGhidra)
+extracts per-function metadata, the ingest script writes it as
+`build/pico_blinky/tables/functions.parquet`, and the exit-criterion
+query returns real Pico SDK function names. The warehouse is a tree
+of Parquet files under `build/<target>/tables/`, not an embedded DB
+file — see `notes/design-decisions.md` §D15 for the rationale.
 
-The immediate next action for the user is captured in
-[`targets/README.md`](./targets/README.md): install prerequisites
-(per `SETUP.md`), build the Raspberry Pi Pico SDK blinky example,
-copy the resulting ELF to `targets/pico_blinky/blink.elf`, and run
-`snakemake --cores 4`.
-
-The Phase 0 exit criterion is: after `snakemake` succeeds, running
-`duckdb build/warehouse.duckdb "SELECT name, size FROM functions WHERE
+The Phase 0 exit criterion was: after `snakemake` succeeds, running
+`scripts/query "SELECT name, size FROM functions WHERE
 source='pico_blinky' ORDER BY size DESC LIMIT 10"` returns a list of
-function names from the Pico blinky binary. Phase 0 is done when that
-query returns data.
+function names from the Pico blinky binary. This currently passes.
+
+The next step is **widening Stage 0 extraction** to cover
+`basic_blocks`, `calls`, `xrefs`, and `strings`, before adding a
+second target. The plan's phrasing of "add a second target next" was
+deprioritized because widening extraction unlocks queries the
+single-table warehouse can't answer, while adding targets to a
+too-thin schema merely duplicates the thinness.
 
 ## Non-goals and constraints (read carefully)
 
@@ -81,13 +82,18 @@ that was already had is wasteful.
 
 See `notes/design-decisions.md` for the full log with reasoning. Summary:
 
-- **Ghidra + Ghidrathon** for static extraction (Python 3, not Jython 2).
-- **DuckDB for analytics, SQLite for coordination.** DuckDB holds the
-  fact warehouse. SQLite is reserved for the future agent swarm
-  coordination layer (task queue, contracts, evidence log).
-- **JSONL intermediate format** for extraction output, not Parquet.
-  Simpler to write from Ghidrathon without extra dependencies.
-  Migrate to Parquet later if row volume demands it.
+- **Ghidra + PyGhidra** for static extraction (Python 3 via
+  `pyghidraRun -H`, Ghidra 11.2+ ships PyGhidra natively — D5 was
+  superseded by D17 when the original Ghidrathon setup turned out to
+  be redundant on modern Ghidra).
+- **Parquet-as-truth for the analytical warehouse, DuckDB as the
+  query engine.** Per-(target, table) Parquet files under
+  `build/<target>/tables/`. No persistent `.duckdb` file. SQLite is
+  still reserved for the future agent-swarm coordination layer. D3
+  was revisited by D15.
+- **JSONL extractor→ingest intermediate** (D4, revisited by D16).
+  Debuggable, stdlib-only on the extractor side, trivial to
+  parse-and-convert in the ingest step.
 - **Snakemake as orchestrator** for deterministic pipeline stages.
   Rules are target-agnostic; adding a target is one edit to
   `config.yaml`.
@@ -147,22 +153,28 @@ snakemake --cores 4
 snakemake --cores 4 -n
 
 # Query the warehouse after a successful run
-duckdb build/warehouse.duckdb \
-    "SELECT source, COUNT(*) AS n FROM functions GROUP BY source"
+scripts/query "SELECT source, COUNT(*) AS n FROM functions GROUP BY source"
 
 # Inspect largest functions in a specific target
-duckdb build/warehouse.duckdb \
-    "SELECT name, size FROM functions WHERE source='pico_blinky' ORDER BY size DESC LIMIT 20"
+scripts/query "SELECT name, size FROM functions WHERE source='pico_blinky' ORDER BY size DESC LIMIT 20"
+
+# List all registered tables (auto-discovered from build/*/tables/*.parquet)
+scripts/query
+
+# Interactive DuckDB REPL with all tables pre-loaded as views
+scripts/query --repl
 
 # Clean all pipeline outputs (regeneratable)
 snakemake clean
 # or: rm -rf build/
 
-# Verify Ghidra headless is reachable
-analyzeHeadless --help 2>&1 | head -3
-# If not on $PATH:
-$GHIDRA_HEADLESS --help
+# Verify the PyGhidra launcher is reachable
+$GHIDRA_PYGHIDRA -H 2>&1 | tail -3
 ```
+
+All three environment variables (`GHIDRA_PYGHIDRA`, `JAVA_HOME`,
+`PYTHON`) are persisted in `~/.zshrc`. See `SETUP.md` for what they
+should point to on a fresh machine.
 
 ## Repository layout
 
@@ -186,13 +198,12 @@ ripcord/
 │   ├── fingerprinting.md
 │   ├── local-ml-fingerprinting.md
 │   └── use-cases-and-strategy.md
-├── schema/
-│   └── 001_init.sql                  (DuckDB functions table)
 ├── scripts/
+│   ├── query                         (SQL over build/*/tables/*.parquet)
 │   ├── ghidra/
-│   │   └── export_functions.py       (Ghidrathon extraction)
+│   │   └── export_functions.py       (PyGhidra extraction)
 │   └── ingest/
-│       └── load_functions.py         (JSONL → DuckDB)
+│       └── load_functions.py         (JSONL → Parquet, schema inline)
 └── targets/                          (test binaries, gitignored)
     └── README.md                     (build instructions)
 ```

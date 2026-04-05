@@ -29,8 +29,8 @@ testing.
 
 ### Stage 0 — Ingest
 
-- Run Ghidra headless (`analyzeHeadless`) on the firmware binary with a
-  Ghidrathon-based (Python 3) script.
+- Run Ghidra headless (`pyghidraRun -H`, which is `analyzeHeadless`
+  launched under PyGhidra's Python 3 runtime) on the firmware binary.
 - Export: function list, basic blocks, P-Code / HighFunction IR, call graph,
   xrefs, strings, data references, initial decompiler output.
 - Emit as Parquet files (typed, compressed, columnar — far better than JSON

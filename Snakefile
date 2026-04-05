@@ -1,13 +1,17 @@
 # ripcord — Phase 0 pipeline
 #
 # Extracts function metadata from each target binary via Ghidra headless
-# (driving a PyGhidra postScript) and ingests the results into a DuckDB
-# warehouse. Targets are declared in config.yaml.
+# (driving a PyGhidra postScript) and writes the results as typed Parquet
+# files under build/<target>/tables/. Targets are declared in config.yaml.
+#
+# The warehouse is the tree of parquet files, not an embedded database
+# file. Query it with scripts/query or any Parquet-capable tool. See
+# notes/design-decisions.md §D15 for the rationale.
 #
 # Usage:
 #   snakemake --cores 4          # run full pipeline
 #   snakemake --cores 4 -n       # dry run, show DAG
-#   snakemake -- clean           # remove all build outputs
+#   snakemake clean              # remove all build outputs
 #
 # Environment variables honored:
 #   GHIDRA_PYGHIDRA   path to pyghidraRun if not on $PATH (modern Ghidra
@@ -29,7 +33,7 @@ REPO_ROOT = Path(workflow.basedir).resolve()
 
 rule all:
     input:
-        "build/warehouse.duckdb"
+        expand("build/{target}/tables/functions.parquet", target=TARGETS),
 
 
 rule ghidra_export:
@@ -62,19 +66,18 @@ rule ghidra_export:
         """
 
 
-rule ingest_to_duckdb:
-    """Load all per-target JSONL files into a single DuckDB warehouse."""
+rule ingest_functions:
+    """Load one target's function JSONL into a typed Parquet table."""
     input:
-        jsonls = expand("build/{target}/functions.jsonl", target=TARGETS),
-        schema = "schema/001_init.sql",
+        jsonl = "build/{target}/functions.jsonl",
     output:
-        db = "build/warehouse.duckdb",
+        parquet = "build/{target}/tables/functions.parquet",
     shell:
         r"""
         {PYTHON} scripts/ingest/load_functions.py \
-            --db {output.db} \
-            --schema {input.schema} \
-            {input.jsonls}
+            --source {wildcards.target} \
+            --output {output.parquet} \
+            {input.jsonl}
         """
 
 

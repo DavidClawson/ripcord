@@ -58,7 +58,7 @@ The default `config.yaml` already references
 
 ```bash
 snakemake --cores 4
-duckdb build/warehouse.duckdb \
+scripts/query \
     "SELECT name, size FROM functions WHERE source='pico_blinky' ORDER BY size DESC LIMIT 10"
 ```
 

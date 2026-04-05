@@ -1,118 +1,115 @@
 #!/usr/bin/env python3
-"""Load per-target function JSONL files into a DuckDB warehouse.
+"""Load a per-target function JSONL file into a typed Parquet table.
 
-Each JSONL file is expected at build/<target>/functions.jsonl, and its
-target name is inferred from the directory. Re-ingest is idempotent:
-rows for a given source are deleted and reinserted, so the warehouse
-reflects the most recent extraction.
+Reads one JSONL file produced by scripts/ghidra/export_functions.py and
+writes it as build/<target>/tables/functions.parquet with an explicit
+pyarrow schema. One invocation, one target, one output file — the
+Snakemake rule fans out over targets via wildcards.
+
+The schema defined here is the single source of truth for the
+`functions` table. There is no separate DDL file; if a column type
+needs to change, change it here and re-run the pipeline.
 """
 
 from __future__ import annotations
 
 import argparse
-import re
+import json
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
-import duckdb
+import pyarrow as pa
+import pyarrow.parquet as pq
 
 
-TARGET_NAME_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]*$")
+FUNCTIONS_SCHEMA = pa.schema(
+    [
+        ("source", pa.string()),
+        ("addr", pa.int64()),
+        ("name", pa.string()),
+        ("size", pa.int64()),
+        ("is_thunk", pa.bool_()),
+        ("is_external", pa.bool_()),
+        ("num_params", pa.int32()),
+        ("has_varargs", pa.bool_()),
+        ("calling_convention", pa.string()),
+        ("basic_block_count", pa.int32()),
+        ("signature", pa.string()),
+        ("extracted_at", pa.timestamp("us", tz="UTC")),
+    ]
+)
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--db", required=True, type=Path, help="path to DuckDB file")
-    parser.add_argument("--schema", required=True, type=Path, help="SQL schema file to apply")
-    parser.add_argument("jsonl", nargs="+", type=Path, help="JSONL files to ingest")
+    parser.add_argument(
+        "--source",
+        required=True,
+        help="target name, stamped into every row as the `source` column",
+    )
+    parser.add_argument(
+        "--output",
+        required=True,
+        type=Path,
+        help="path to the output .parquet file",
+    )
+    parser.add_argument(
+        "jsonl",
+        type=Path,
+        help="input JSONL file produced by the Ghidra extractor",
+    )
     return parser.parse_args()
 
 
-def target_name_from_path(path: Path) -> str:
-    """Extract the target name from a build/<target>/functions.jsonl path."""
-    name = path.parent.name
-    if not TARGET_NAME_RE.match(name):
-        raise ValueError(f"Unsafe target name derived from path {path}: {name!r}")
-    return name
-
-
-def ingest_one(conn: duckdb.DuckDBPyConnection, jsonl_path: Path) -> int:
-    target = target_name_from_path(jsonl_path)
-    abs_path = str(jsonl_path.resolve())
-
-    # Delete any existing rows for this source so reruns are idempotent.
-    conn.execute("DELETE FROM functions WHERE source = ?", [target])
-
-    # DuckDB's read_json_auto needs a literal string path, but the target
-    # name is a validated identifier so parameterising via f-string is safe.
-    # The path is also quoted below.
-    conn.execute(
-        f"""
-        INSERT INTO functions (
-            source, addr, name, size,
-            is_thunk, is_external, num_params, has_varargs,
-            calling_convention, basic_block_count, signature
-        )
-        SELECT
-            '{target}'            AS source,
-            addr,
-            name,
-            size,
-            is_thunk,
-            is_external,
-            num_params,
-            has_varargs,
-            calling_convention,
-            basic_block_count,
-            signature
-        FROM read_json_auto('{abs_path}', format='newline_delimited')
-        """
-    )
-
-    (count,) = conn.execute(
-        "SELECT COUNT(*) FROM functions WHERE source = ?", [target]
-    ).fetchone()
-    return count
+def read_jsonl_rows(path: Path, source: str, extracted_at: datetime):
+    with path.open() as fh:
+        for line_number, line in enumerate(fh, start=1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise SystemExit(
+                    f"{path}:{line_number}: invalid JSON: {exc}"
+                ) from exc
+            yield {
+                "source": source,
+                "addr": int(rec["addr"]),
+                "name": rec.get("name") or "",
+                "size": rec.get("size"),
+                "is_thunk": rec.get("is_thunk"),
+                "is_external": rec.get("is_external"),
+                "num_params": rec.get("num_params"),
+                "has_varargs": rec.get("has_varargs"),
+                "calling_convention": rec.get("calling_convention"),
+                "basic_block_count": rec.get("basic_block_count"),
+                "signature": rec.get("signature"),
+                "extracted_at": extracted_at,
+            }
 
 
 def main() -> int:
     args = parse_args()
 
-    args.db.parent.mkdir(parents=True, exist_ok=True)
-    conn = duckdb.connect(str(args.db))
+    if not args.jsonl.exists():
+        print(f"error: {args.jsonl} does not exist", file=sys.stderr)
+        return 1
 
-    # Apply schema (idempotent via CREATE ... IF NOT EXISTS).
-    schema_sql = args.schema.read_text()
-    conn.execute(schema_sql)
+    extracted_at = datetime.now(timezone.utc)
+    rows = list(read_jsonl_rows(args.jsonl, args.source, extracted_at))
 
-    total = 0
-    for jsonl_path in args.jsonl:
-        if not jsonl_path.exists():
-            print(f"warning: {jsonl_path} does not exist, skipping", file=sys.stderr)
-            continue
-        ingested = ingest_one(conn, jsonl_path)
-        print(f"ingested {ingested} rows from {jsonl_path}")
-        total += ingested
+    args.output.parent.mkdir(parents=True, exist_ok=True)
 
-    (warehouse_total,) = conn.execute("SELECT COUNT(*) FROM functions").fetchone()
-    print(f"warehouse now contains {warehouse_total} function rows across all sources")
+    table = pa.Table.from_pylist(rows, schema=FUNCTIONS_SCHEMA)
+    pq.write_table(table, args.output, compression="zstd")
 
-    summary = conn.execute(
-        """
-        SELECT source,
-               COUNT(*) AS functions,
-               COALESCE(SUM(size), 0) AS total_bytes
-        FROM functions
-        GROUP BY source
-        ORDER BY source
-        """
-    ).fetchall()
-    if summary:
-        print("per-source summary:")
-        for source, n, total_bytes in summary:
-            print(f"  {source}: {n} functions, {total_bytes} bytes of code")
-
-    conn.close()
+    total_bytes = sum((r["size"] or 0) for r in rows)
+    print(
+        f"wrote {len(rows)} functions "
+        f"({total_bytes} bytes of code) to {args.output}"
+    )
     return 0
 
 
