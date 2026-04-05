@@ -1,7 +1,7 @@
 # ripcord — Phase 0 pipeline
 #
 # Extracts function metadata from each target binary via Ghidra headless
-# (using a Ghidrathon script) and ingests the results into a DuckDB
+# (driving a PyGhidra postScript) and ingests the results into a DuckDB
 # warehouse. Targets are declared in config.yaml.
 #
 # Usage:
@@ -10,7 +10,9 @@
 #   snakemake -- clean           # remove all build outputs
 #
 # Environment variables honored:
-#   GHIDRA_HEADLESS   path to analyzeHeadless if not on $PATH
+#   GHIDRA_PYGHIDRA   path to pyghidraRun if not on $PATH (modern Ghidra
+#                     ships this; invoking it with -H runs analyzeHeadless
+#                     under PyGhidra so .py postScripts get Python 3)
 #   PYTHON            path to the Python interpreter for ingest (default: python3)
 
 import os
@@ -18,7 +20,7 @@ from pathlib import Path
 
 configfile: "config.yaml"
 
-GHIDRA_HEADLESS = os.environ.get("GHIDRA_HEADLESS", "analyzeHeadless")
+GHIDRA_PYGHIDRA = os.environ.get("GHIDRA_PYGHIDRA", "pyghidraRun")
 PYTHON = os.environ.get("PYTHON", "python3")
 
 TARGETS = list(config["targets"].keys())
@@ -33,9 +35,11 @@ rule all:
 rule ghidra_export:
     """Run Ghidra headless on one target binary and dump function metadata.
 
-    The Ghidrathon script writes a JSONL file (one function per line).
+    The PyGhidra postScript writes a JSONL file (one function per line).
     Ghidra's project database lives under build/<target>/ghidra_project/
-    so reruns are incremental.
+    so reruns are incremental. `pyghidraRun -H` is analyzeHeadless launched
+    under PyGhidra, which is what lets the .py postScript see a Python 3
+    runtime.
     """
     input:
         elf = lambda wc: config["targets"][wc.target]["elf"],
@@ -49,7 +53,7 @@ rule ghidra_export:
     shell:
         r"""
         mkdir -p {params.project_dir} $(dirname {output.jsonl})
-        {GHIDRA_HEADLESS} {params.project_dir} {params.project_name} \
+        {GHIDRA_PYGHIDRA} -H {params.project_dir} {params.project_name} \
             -import {input.elf} \
             -overwrite \
             -scriptPath {params.script_path} \

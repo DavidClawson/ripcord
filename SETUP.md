@@ -8,58 +8,50 @@ binary it is pointed at via `config.yaml`.
 
 ### Ghidra
 
-Latest stable release, running on your local machine. Installed via
-Homebrew (`brew install --cask ghidra`) or downloaded from
-https://ghidra-sre.org/. The pipeline invokes `analyzeHeadless`, which
-ships with every Ghidra install under `<ghidra_root>/support/`.
-
-If `analyzeHeadless` is not on your `$PATH`, export its location
-before running the pipeline:
+Latest stable release, running on your local machine. On macOS,
+install via Homebrew as a formula (the old cask no longer exists):
 
 ```bash
-export GHIDRA_HEADLESS=/Applications/ghidra_11.3_PUBLIC/support/analyzeHeadless
+brew install ghidra
 ```
 
-(Replace the path with whichever version you have installed.) The
-Snakefile picks up this variable.
+Or download from https://ghidra-sre.org/. The pipeline drives Ghidra
+via `pyghidraRun -H`, which lives alongside `analyzeHeadless` under
+`<ghidra_root>/support/`. The Homebrew formula puts it at
+`/opt/homebrew/opt/ghidra/libexec/support/pyghidraRun`. See the
+[Environment variables](#environment-variables) section below for the
+`GHIDRA_PYGHIDRA` and `JAVA_HOME` variables the Snakefile expects.
 
-### Ghidrathon
+### PyGhidra (Python 3 scripting inside Ghidra)
 
+Historical note: ripcord originally used
 [Mandiant's Ghidrathon extension](https://github.com/mandiant/Ghidrathon)
-replaces Ghidra's bundled Jython 2 with modern CPython 3, which makes
-extraction scripts sane to write and lets them share a Python
-environment with the rest of the pipeline.
+to get CPython 3 inside Ghidra. Ghidra 11.2+ ships **PyGhidra natively**
+and its `PyGhidraScriptProvider` claims `.py` files at the JVM level,
+so Ghidrathon is redundant on modern Ghidra. ripcord uses native
+PyGhidra, invoked via `pyghidraRun -H` (which is `analyzeHeadless`
+launched under a Python 3 runtime).
 
-1. Check your Ghidra version (`Help → About Ghidra`).
-2. Download the Ghidrathon release matching that Ghidra version from
-   https://github.com/mandiant/Ghidrathon/releases.
-3. In Ghidra, go to `File → Install Extensions` and install the
-   downloaded `.zip`.
-4. Restart Ghidra.
-5. In Ghidra's Script Manager, configure the Python interpreter path
-   to point at the same Python you use for the rest of the pipeline
-   (see next section).
+You do not install PyGhidra as a Ghidra extension — you install the
+companion `pyghidra` Python package into the same venv the rest of
+the pipeline uses. It brings `jpype1` along as a dependency, which
+is what bridges Python to Ghidra's JVM. See the Python section below.
 
 ### Python 3.11+
 
-Any modern Python will do. The pipeline uses the following packages:
-
-```bash
-pip install 'duckdb>=0.10' pyarrow polars snakemake
-```
-
-Those same packages need to be available to Ghidrathon (so extraction
-scripts can write Parquet or JSON if they need to). The cleanest
-setup is a single virtualenv used both by Ghidrathon and by Snakemake:
+A single virtualenv is used for Snakemake, DuckDB/Polars ingest, and
+PyGhidra:
 
 ```bash
 python3 -m venv ~/.venvs/ripcord
 source ~/.venvs/ripcord/bin/activate
-pip install 'duckdb>=0.10' pyarrow polars snakemake
+pip install 'duckdb>=0.10' pyarrow polars snakemake pyghidra
 ```
 
-Then point Ghidrathon at `~/.venvs/ripcord/bin/python` during its
-configuration step.
+`pyghidra` pulls in `jpype1`, which builds a native extension against
+your Python version. On Python 3.14 there are no prebuilt wheels yet,
+so pip will compile from source (~20 seconds). A C toolchain is
+required (Xcode command line tools on macOS).
 
 ### DuckDB CLI (optional but recommended)
 
@@ -99,24 +91,44 @@ snakemake --version
 - **Soufflé** — Datalog engine for the fact derivation layer. Later
   phase.
 
+## Environment variables
+
+The Snakefile reads three environment variables. Set them in your
+shell (or put them in `~/.zshrc`) before running the pipeline:
+
+```bash
+# Ghidra's PyGhidra launcher (analyzeHeadless under a Python 3 runtime)
+export GHIDRA_PYGHIDRA=/opt/homebrew/opt/ghidra/libexec/support/pyghidraRun
+
+# JDK 21 for PyGhidra. Ghidra 12.x requires JDK 21+; PyGhidra reads
+# JAVA_HOME (unlike analyzeHeadless, which auto-detects).
+export JAVA_HOME=/opt/homebrew/opt/openjdk@21/libexec/openjdk.jdk/Contents/Home
+
+# Pin the Python interpreter Snakemake uses for the DuckDB ingest rule
+# to the pipeline venv, not whatever `python3` resolves to on $PATH.
+export PYTHON=$HOME/.venvs/ripcord/bin/python
+```
+
+`openjdk@21` is installed automatically as a transitive dependency of
+`brew install ghidra`.
+
 ## Verifying the environment
 
 Once Ghidra and the Python environment are set up:
 
 ```bash
-# Ghidra headless
-analyzeHeadless --help 2>&1 | head -3
-#   (or: $GHIDRA_HEADLESS --help)
+# PyGhidra launcher (prints version info and exits non-zero without args — expected)
+$GHIDRA_PYGHIDRA -H 2>&1 | tail -3
 
 # Python environment
-python -c "import duckdb, pyarrow, snakemake; print('python ok')"
+source ~/.venvs/ripcord/bin/activate
+python -c "import duckdb, pyarrow, snakemake, pyghidra; print('python ok')"
 
 # Snakemake
 snakemake --version
 ```
 
-All three should return without error. You are then ready to build a
-test target and run the pipeline.
+You are then ready to build a test target and run the pipeline.
 
 ## Building a first test target
 

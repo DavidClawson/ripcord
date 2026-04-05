@@ -25,28 +25,32 @@ brew install cmake ninja
 
 ### Build
 
-```bash
-# Clone the Pico SDK somewhere convenient (outside ripcord)
-git clone --depth 1 https://github.com/raspberrypi/pico-sdk ~/pico-sdk
-cd ~/pico-sdk
-git submodule update --init --depth 1
+In Pico SDK 2.x the example projects live in a separate repository
+(`raspberrypi/pico-examples`), not inside the SDK itself.
 
-# Build the official blink example
+```bash
+# Clone the Pico SDK and the examples repo (outside ripcord)
+git clone --depth 1 https://github.com/raspberrypi/pico-sdk ~/pico-sdk
+cd ~/pico-sdk && git submodule update --init --depth 1
+
+git clone --depth 1 https://github.com/raspberrypi/pico-examples ~/pico-examples
+
+# Build the blink example
 export PICO_SDK_PATH=~/pico-sdk
-cd ~/pico-sdk/examples
+cd ~/pico-examples
 mkdir -p build && cd build
 cmake -G Ninja ..
-ninja blink/blink
+ninja blink
 ```
 
-The ELF lands at `~/pico-sdk/examples/build/blink/blink.elf`.
+The ELF lands at `~/pico-examples/build/blink/blink.elf`.
 
 ### Wire it into ripcord
 
 ```bash
 cd ~/Desktop/ripcord
 mkdir -p targets/pico_blinky
-cp ~/pico-sdk/examples/build/blink/blink.elf targets/pico_blinky/blink.elf
+cp ~/pico-examples/build/blink/blink.elf targets/pico_blinky/blink.elf
 ```
 
 The default `config.yaml` already references
