@@ -8,8 +8,11 @@ recovered_calls.jsonl ready for ingest. No Ghidra session required.
 Five recovery mechanisms:
 
   1. vector_table  — Read the Cortex-M vector table directly from the
-                     binary. Each entry pointing to a known function is
-                     an ISR handler entry point. (confidence 1.0)
+                     binary. Entries matching known functions get confidence
+                     1.0; mid-body ISR entry points in existing functions
+                     get 0.9; undiscovered entry points get 0.85. For raw
+                     binary imports where Ghidra missed many function starts,
+                     all valid code-region entries are emitted.
 
   2. func_ptr_ref  — From the xrefs table, find non-call references
                      (DATA, PARAM, WRITE, INDIRECTION) from function
@@ -21,7 +24,10 @@ Five recovery mechanisms:
   4. binary_const  — Scan all loadable segments for 32-bit values that
                      match function entry points (with Thumb bit set).
                      Catches literal pool entries, init arrays, and data
-                     tables that the xrefs table misses. (confidence 0.5)
+                     tables that the xrefs table misses. Known targets get
+                     confidence 0.5; for raw binaries, Thumb-bit-set values
+                     pointing into the code region but not matching any
+                     known function get 0.35 (undiscovered targets).
 
   5. registrar_dispatch — When function A references function B as data
                      AND calls function C, infer C→B dispatch edge.
@@ -111,7 +117,8 @@ _VECTOR_NAMES = {
 }
 
 
-def read_vector_table_elf(elf_path: str, function_addrs: set[int]) -> list[dict]:
+def read_vector_table_elf(elf_path: str, function_addrs: set[int],
+                          function_ranges: list[tuple[int, int, str]] | None = None) -> list[dict]:
     """Read vector table from an ELF file's loadable segments."""
     recovered = []
     data = Path(elf_path).read_bytes()
@@ -163,6 +170,9 @@ def read_vector_table_elf(elf_path: str, function_addrs: set[int]) -> list[dict]
     if not (0x20000000 <= initial_sp <= 0x20400000):
         return recovered
 
+    # Build sorted function ranges for body-containment checks
+    sorted_ranges = sorted(function_ranges or [], key=lambda x: x[0])
+
     # Read vector table entries
     max_vectors = min(256, (load_filesz - 4) // 4)
     for i in range(1, max_vectors + 1):
@@ -176,10 +186,11 @@ def read_vector_table_elf(elf_path: str, function_addrs: set[int]) -> list[dict]
         if func_addr == 0 or raw_value == 0xFFFFFFFF:
             continue
 
+        name = _VECTOR_NAMES.get(
+            i, "IRQ{}".format(i - 16) if i >= 16 else "Exception{}".format(i)
+        )
+
         if func_addr in function_addrs:
-            name = _VECTOR_NAMES.get(
-                i, "IRQ{}".format(i - 16) if i >= 16 else "Exception{}".format(i)
-            )
             recovered.append({
                 "caller_addr": None,
                 "callee_addr": func_addr,
@@ -188,12 +199,55 @@ def read_vector_table_elf(elf_path: str, function_addrs: set[int]) -> list[dict]
                 "confidence": 1.0,
                 "detail": "vector[{}] = {}".format(i, name),
             })
+        elif sorted_ranges:
+            # For ELF targets we typically have good function coverage,
+            # but still check for mid-body/undiscovered entry points
+            containing_func = None
+            for fstart, fsize, fname in sorted_ranges:
+                if fstart <= func_addr < fstart + fsize:
+                    containing_func = (fstart, fsize, fname)
+                    break
+                if fstart > func_addr:
+                    break
+
+            if containing_func:
+                fstart, fsize, fname = containing_func
+                offset_in = func_addr - fstart
+                recovered.append({
+                    "caller_addr": None,
+                    "callee_addr": func_addr,
+                    "call_site_addr": load_vaddr + i * 4,
+                    "mechanism": "vector_table",
+                    "confidence": 0.9,
+                    "detail": "vector[{}] = {} (mid-body +{} in {} @ 0x{:08x})".format(
+                        i, name, offset_in, fname, fstart
+                    ),
+                })
+            else:
+                recovered.append({
+                    "caller_addr": None,
+                    "callee_addr": func_addr,
+                    "call_site_addr": load_vaddr + i * 4,
+                    "mechanism": "vector_table",
+                    "confidence": 0.85,
+                    "detail": "vector[{}] = {} (undiscovered entry point)".format(i, name),
+                })
 
     return recovered
 
 
-def read_vector_table_raw(bin_path: str, base_addr: int, function_addrs: set[int]) -> list[dict]:
-    """Read vector table from a raw binary file."""
+def read_vector_table_raw(bin_path: str, base_addr: int, function_addrs: set[int],
+                          function_ranges: list[tuple[int, int, str]] | None = None) -> list[dict]:
+    """Read vector table from a raw binary file.
+
+    For raw binary imports (e.g. stock firmware loaded via BinaryLoader),
+    Ghidra often doesn't create functions at vector table targets because
+    it doesn't know where the vector table is. We emit entries for ALL
+    valid-looking code addresses, classifying them as:
+      - known function entry (confidence 1.0)
+      - mid-body entry point inside an existing function (confidence 0.9)
+      - undiscovered entry point in a gap between functions (confidence 0.85)
+    """
     recovered = []
     data = Path(bin_path).read_bytes()
 
@@ -203,6 +257,13 @@ def read_vector_table_raw(bin_path: str, base_addr: int, function_addrs: set[int
     initial_sp = struct.unpack_from("<I", data, 0)[0]
     if not (0x20000000 <= initial_sp <= 0x20400000):
         return recovered
+
+    # Build sorted function ranges for body-containment checks
+    sorted_ranges = sorted(function_ranges or [], key=lambda x: x[0])
+
+    # Compute the code region bounds from the binary
+    code_start = base_addr
+    code_end = base_addr + len(data)
 
     max_vectors = min(256, (len(data) - 4) // 4)
     for i in range(1, max_vectors + 1):
@@ -216,10 +277,16 @@ def read_vector_table_raw(bin_path: str, base_addr: int, function_addrs: set[int
         if func_addr == 0 or raw_value == 0xFFFFFFFF:
             continue
 
+        # Must be within the binary's code region
+        if not (code_start <= func_addr < code_end):
+            continue
+
+        name = _VECTOR_NAMES.get(
+            i, "IRQ{}".format(i - 16) if i >= 16 else "Exception{}".format(i)
+        )
+
         if func_addr in function_addrs:
-            name = _VECTOR_NAMES.get(
-                i, "IRQ{}".format(i - 16) if i >= 16 else "Exception{}".format(i)
-            )
+            # Known function entry point
             recovered.append({
                 "caller_addr": None,
                 "callee_addr": func_addr,
@@ -228,6 +295,39 @@ def read_vector_table_raw(bin_path: str, base_addr: int, function_addrs: set[int
                 "confidence": 1.0,
                 "detail": "vector[{}] = {}".format(i, name),
             })
+        else:
+            # Check if it falls within an existing function body
+            containing_func = None
+            for fstart, fsize, fname in sorted_ranges:
+                if fstart <= func_addr < fstart + fsize:
+                    containing_func = (fstart, fsize, fname)
+                    break
+                if fstart > func_addr:
+                    break
+
+            if containing_func:
+                fstart, fsize, fname = containing_func
+                offset_in = func_addr - fstart
+                recovered.append({
+                    "caller_addr": None,
+                    "callee_addr": func_addr,
+                    "call_site_addr": base_addr + i * 4,
+                    "mechanism": "vector_table",
+                    "confidence": 0.9,
+                    "detail": "vector[{}] = {} (mid-body +{} in {} @ 0x{:08x})".format(
+                        i, name, offset_in, fname, fstart
+                    ),
+                })
+            else:
+                # Undiscovered entry point — not in any known function
+                recovered.append({
+                    "caller_addr": None,
+                    "callee_addr": func_addr,
+                    "call_site_addr": base_addr + i * 4,
+                    "mechanism": "vector_table",
+                    "confidence": 0.85,
+                    "detail": "vector[{}] = {} (undiscovered entry point)".format(i, name),
+                })
 
     return recovered
 
@@ -237,7 +337,8 @@ def read_vector_table_raw(bin_path: str, base_addr: int, function_addrs: set[int
 # -----------------------------------------------------------------------
 
 def scan_binary_constants_elf(elf_path: str, function_addrs: set[int],
-                               function_ranges: list[tuple[int, int, str]]) -> list[dict]:
+                               function_ranges: list[tuple[int, int, str]],
+                               extra_known_addrs: set[int] | None = None) -> list[dict]:
     """Scan all loadable ELF segments for 32-bit values matching function entries.
 
     For Cortex-M (Thumb), function pointers have bit 0 set. We scan for
@@ -343,45 +444,78 @@ def scan_binary_constants_elf(elf_path: str, function_addrs: set[int],
 
 def scan_binary_constants_raw(bin_path: str, base_addr: int,
                                function_addrs: set[int],
-                               function_ranges: list[tuple[int, int, str]]) -> list[dict]:
-    """Scan a raw binary for function pointer constants."""
+                               function_ranges: list[tuple[int, int, str]],
+                               extra_known_addrs: set[int] | None = None) -> list[dict]:
+    """Scan a raw binary for function pointer constants.
+
+    For raw binary imports, we match against:
+      1. Known Ghidra function entries (confidence 0.5)
+      2. Addresses discovered by vector table scan (confidence 0.5)
+      3. Thumb-bit-set values pointing into the code region that are
+         NOT known functions — likely undiscovered function pointers
+         (confidence 0.35)
+
+    The extra_known_addrs parameter allows passing in addresses discovered
+    by earlier mechanisms (e.g. vector table) to expand the match set.
+    """
     recovered = []
     data = Path(bin_path).read_bytes()
 
     func_starts = sorted(function_ranges, key=lambda x: x[0])
-    thumb_addrs = {addr | 1 for addr in function_addrs}
-    all_targets = function_addrs | thumb_addrs
+
+    # Build the set of known targets (Ghidra functions + extra discoveries)
+    known_addrs = set(function_addrs)
+    if extra_known_addrs:
+        known_addrs |= extra_known_addrs
+    thumb_addrs = {addr | 1 for addr in known_addrs}
+    known_targets = known_addrs | thumb_addrs
+
+    # Code region for recognizing potential undiscovered function pointers
+    code_start = base_addr
+    code_end = base_addr + len(data)
 
     # Skip vector table (first 1024 bytes)
     vector_end = min(1024, len(data))
-    seen_pairs = set()
+    seen_pairs: set[tuple[int, int]] = set()
 
     for off in range(vector_end, len(data) - 3, 4):
         vaddr = base_addr + off
         value = struct.unpack_from("<I", data, off)[0]
 
-        if value in all_targets:
-            func_addr = value & ~1
-            if func_addr == vaddr:
-                continue
+        func_addr = value & ~1
+        is_thumb = (value & 1) == 1
 
-            owner_addr = None
-            owner_name = None
-            for fstart, fsize, fname in reversed(func_starts):
-                if fstart <= vaddr:
-                    if vaddr < fstart + fsize + 256:
-                        owner_addr = fstart
-                        owner_name = fname
-                    break
+        if func_addr == 0 or value == 0xFFFFFFFF:
+            continue
+        if func_addr == vaddr:
+            continue
 
-            if owner_addr is None:
-                continue
+        is_known = value in known_targets
+        is_code_ptr = (is_thumb and code_start <= func_addr < code_end
+                       and func_addr not in known_addrs)
 
-            pair = (owner_addr, func_addr)
-            if pair in seen_pairs:
-                continue
-            seen_pairs.add(pair)
+        if not is_known and not is_code_ptr:
+            continue
 
+        # Find the owning function for this constant
+        owner_addr = None
+        owner_name = None
+        for fstart, fsize, fname in reversed(func_starts):
+            if fstart <= vaddr:
+                if vaddr < fstart + fsize + 256:
+                    owner_addr = fstart
+                    owner_name = fname
+                break
+
+        if owner_addr is None:
+            continue
+
+        pair = (owner_addr, func_addr)
+        if pair in seen_pairs:
+            continue
+        seen_pairs.add(pair)
+
+        if is_known:
             recovered.append({
                 "caller_addr": owner_addr,
                 "callee_addr": func_addr,
@@ -389,6 +523,16 @@ def scan_binary_constants_raw(bin_path: str, base_addr: int,
                 "mechanism": "binary_const",
                 "confidence": 0.5,
                 "detail": "0x{:08x} in/near {}".format(vaddr, owner_name),
+            })
+        else:
+            # Undiscovered code pointer — lower confidence
+            recovered.append({
+                "caller_addr": owner_addr,
+                "callee_addr": func_addr,
+                "call_site_addr": vaddr,
+                "mechanism": "binary_const",
+                "confidence": 0.35,
+                "detail": "0x{:08x} in/near {} (undiscovered target)".format(vaddr, owner_name),
             })
 
     return recovered
@@ -398,8 +542,14 @@ def scan_binary_constants_raw(bin_path: str, base_addr: int,
 # Mechanism 2: Function-pointer references from xrefs table
 # -----------------------------------------------------------------------
 
-def recover_func_ptr_refs(db, target: str, function_addrs: set[int]) -> list[dict]:
-    """Find non-call xrefs that point to function entry points."""
+def recover_func_ptr_refs(db, target: str, function_addrs: set[int],
+                          extra_known_addrs: set[int] | None = None) -> list[dict]:
+    """Find non-call xrefs that point to function entry points.
+
+    For raw binary imports where Ghidra missed many function starts,
+    extra_known_addrs can supply addresses discovered by other mechanisms
+    (e.g. vector table scan). These matches get slightly lower confidence.
+    """
     rows = db.execute(
         f"""
         SELECT x.function_addr, x.from_addr, x.to_addr, x.ref_type
@@ -410,15 +560,20 @@ def recover_func_ptr_refs(db, target: str, function_addrs: set[int]) -> list[dic
         """
     ).fetchall()
 
+    all_known = set(function_addrs)
+    if extra_known_addrs:
+        all_known |= extra_known_addrs
+
     recovered = []
     for func_addr, from_addr, to_addr, ref_type in rows:
-        if to_addr in function_addrs and to_addr != func_addr:
+        if to_addr in all_known and to_addr != func_addr:
+            conf = 0.7 if to_addr in function_addrs else 0.55
             recovered.append({
                 "caller_addr": func_addr,
                 "callee_addr": to_addr,
                 "call_site_addr": from_addr,
                 "mechanism": "func_ptr_ref",
-                "confidence": 0.7,
+                "confidence": conf,
                 "detail": "{} at 0x{:08x}".format(ref_type, from_addr),
             })
 
@@ -589,6 +744,8 @@ def process_target(db, target: str, config: dict) -> None:
 
     all_recovered = []
     is_arm = False
+    # Addresses discovered by early mechanisms, fed forward to later ones
+    extra_known_addrs: set[int] = set()
 
     # 1. Vector table + binary constant scan (if we have the binary)
     if elf_path and Path(elf_path).exists():
@@ -598,25 +755,45 @@ def process_target(db, target: str, config: dict) -> None:
             with open(elf_path, "rb") as f:
                 magic = f.read(4)
             if magic == b"\x7fELF":
-                vtable = read_vector_table_elf(elf_path, function_addrs)
-                bin_consts = scan_binary_constants_elf(
+                vtable = read_vector_table_elf(
                     elf_path, function_addrs, function_ranges
+                )
+                # Collect newly discovered addresses from vector table
+                for r in vtable:
+                    extra_known_addrs.add(r["callee_addr"])
+                bin_consts = scan_binary_constants_elf(
+                    elf_path, function_addrs, function_ranges,
+                    extra_known_addrs=extra_known_addrs
                 )
             else:
                 base_addr = target_cfg.get("base_addr", 0x08000000)
-                vtable = read_vector_table_raw(elf_path, base_addr, function_addrs)
-                bin_consts = scan_binary_constants_raw(
+                vtable = read_vector_table_raw(
                     elf_path, base_addr, function_addrs, function_ranges
+                )
+                # Collect newly discovered addresses from vector table
+                for r in vtable:
+                    extra_known_addrs.add(r["callee_addr"])
+                bin_consts = scan_binary_constants_raw(
+                    elf_path, base_addr, function_addrs, function_ranges,
+                    extra_known_addrs=extra_known_addrs
                 )
             all_recovered.extend(vtable)
             all_recovered.extend(bin_consts)
+            # Collect addresses from binary_const scan too
+            for r in bin_consts:
+                extra_known_addrs.add(r["callee_addr"])
             print(f"  {target}: vector_table = {len(vtable)}")
             print(f"  {target}: binary_const = {len(bin_consts)}")
     else:
         print(f"  {target}: binary not found at {elf_path}, skipping binary scans")
 
     # 2. Function-pointer references from xrefs table
-    ptr_refs = recover_func_ptr_refs(db, target, function_addrs)
+    #    Pass extra_known_addrs so xref targets matching discovered
+    #    addresses are also captured
+    ptr_refs = recover_func_ptr_refs(
+        db, target, function_addrs,
+        extra_known_addrs=extra_known_addrs if extra_known_addrs else None
+    )
     all_recovered.extend(ptr_refs)
     print(f"  {target}: func_ptr_ref = {len(ptr_refs)}")
 
