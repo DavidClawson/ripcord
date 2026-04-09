@@ -41,6 +41,7 @@ FUNCTIONS_SCHEMA = pa.schema(
         ("calling_convention", pa.string()),
         ("basic_block_count", pa.int32()),
         ("signature", pa.string()),
+        ("body_hash", pa.string()),  # SHA-256 of raw function bytes
         ("extracted_at", pa.timestamp("us", tz="UTC")),
     ]
 )
@@ -59,6 +60,7 @@ def functions_row(rec: dict, source: str, extracted_at) -> dict:
         "calling_convention": rec.get("calling_convention"),
         "basic_block_count": rec.get("basic_block_count"),
         "signature": rec.get("signature"),
+        "body_hash": rec.get("body_hash"),
         "extracted_at": extracted_at,
     }
 
@@ -211,6 +213,119 @@ def strings_row(rec: dict, source: str, extracted_at) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# pcode_features — one row per function with P-Code opcode features
+# ---------------------------------------------------------------------------
+#
+# ISA-invariant features extracted from Ghidra's P-Code intermediate
+# representation. The histogram is a JSON-encoded dict of opcode names
+# to counts; the sequence hash is SHA-256 of the ordered opcode stream.
+# These enable cross-ISA function matching (design decision D9).
+
+PCODE_FEATURES_SCHEMA = pa.schema(
+    [
+        ("source", pa.string()),
+        ("addr", pa.int64()),
+        ("pcode_ops_total", pa.int32()),
+        ("pcode_unique_opcodes", pa.int32()),
+        ("pcode_histogram", pa.string()),  # JSON string
+        ("pcode_sequence_hash", pa.string()),  # SHA-256 hex
+        ("extracted_at", pa.timestamp("us", tz="UTC")),
+    ]
+)
+
+
+def pcode_features_row(rec: dict, source: str, extracted_at) -> dict:
+    # The histogram comes in as a dict from the JSONL; serialize to JSON string
+    histogram = rec.get("pcode_histogram")
+    if isinstance(histogram, dict):
+        import json
+
+        histogram = json.dumps(histogram, sort_keys=True)
+    return {
+        "source": source,
+        "addr": int(rec["addr"]),
+        "pcode_ops_total": rec.get("pcode_ops_total"),
+        "pcode_unique_opcodes": rec.get("pcode_unique_opcodes"),
+        "pcode_histogram": histogram,
+        "pcode_sequence_hash": rec.get("pcode_sequence_hash"),
+        "extracted_at": extracted_at,
+    }
+
+
+# ---------------------------------------------------------------------------
+# mmio_events — one row per MemoryIORead/MemoryIOWrite from a Renode trace
+# ---------------------------------------------------------------------------
+#
+# Populated by parse_trace.py reading a Renode PCAndOpcode execution trace
+# with TrackMemoryAccesses enabled. Each event records the peripheral
+# register address, value, direction, and the PC of the instruction that
+# issued the access. The scenario column distinguishes different execution
+# scenarios (e.g. "boot", "idle", "stress") for the same target.
+
+MMIO_EVENTS_SCHEMA = pa.schema(
+    [
+        ("source", pa.string()),
+        ("scenario", pa.string()),
+        ("sequence_idx", pa.int64()),
+        ("pc", pa.int64()),
+        ("address", pa.int64()),
+        ("value", pa.int64()),
+        ("direction", pa.string()),
+        ("peripheral", pa.string()),
+        ("extracted_at", pa.timestamp("us", tz="UTC")),
+    ]
+)
+
+
+def mmio_events_row(rec: dict, source: str, extracted_at) -> dict:
+    pc = rec.get("pc")
+    return {
+        "source": source,
+        "scenario": rec.get("scenario") or "",
+        "sequence_idx": int(rec["sequence_idx"]),
+        "pc": int(pc) if pc is not None else None,
+        "address": int(rec["address"]),
+        "value": int(rec["value"]),
+        "direction": rec.get("direction") or "",
+        "peripheral": rec.get("peripheral"),
+        "extracted_at": extracted_at,
+    }
+
+
+# ---------------------------------------------------------------------------
+# decompiled — one row per function with Ghidra's decompiled pseudo-C
+# ---------------------------------------------------------------------------
+#
+# Extracted by running DecompInterface on each function. The decompiled_c
+# column can be very large (10KB+ for complex init functions), so we use
+# pa.large_string() to avoid the 2GB per-chunk limit of regular strings.
+# Not included in the default Snakefile ghidra_extract rule because the
+# decompiler is slow (~30s timeout per function).
+
+DECOMPILED_SCHEMA = pa.schema(
+    [
+        ("source", pa.string()),
+        ("addr", pa.int64()),
+        ("name", pa.string()),
+        ("decompiled_c", pa.large_string()),
+        ("decompile_success", pa.bool_()),
+        ("extracted_at", pa.timestamp("us", tz="UTC")),
+    ]
+)
+
+
+def decompiled_row(rec: dict, source: str, extracted_at) -> dict:
+    return {
+        "source": source,
+        "addr": int(rec["addr"]),
+        "name": rec.get("name") or "",
+        "decompiled_c": rec.get("decompiled_c") or "",
+        "decompile_success": rec.get("decompile_success", False),
+        "extracted_at": extracted_at,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Registry
 # ---------------------------------------------------------------------------
 
@@ -220,6 +335,9 @@ TABLES: dict[str, pa.Schema] = {
     "basic_blocks": BASIC_BLOCKS_SCHEMA,
     "xrefs": XREFS_SCHEMA,
     "strings": STRINGS_SCHEMA,
+    "pcode_features": PCODE_FEATURES_SCHEMA,
+    "mmio_events": MMIO_EVENTS_SCHEMA,
+    "decompiled": DECOMPILED_SCHEMA,
 }
 
 ROW_TRANSFORMS: dict[str, Callable] = {
@@ -228,4 +346,7 @@ ROW_TRANSFORMS: dict[str, Callable] = {
     "basic_blocks": basic_blocks_row,
     "xrefs": xrefs_row,
     "strings": strings_row,
+    "pcode_features": pcode_features_row,
+    "mmio_events": mmio_events_row,
+    "decompiled": decompiled_row,
 }

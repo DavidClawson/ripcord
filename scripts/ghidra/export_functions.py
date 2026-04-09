@@ -18,6 +18,7 @@
 # cheap to invoke and its output eyeballable as text. The ingest
 # script is where rows get typed and written to Parquet.
 
+import hashlib
 import json
 import sys
 
@@ -54,7 +55,37 @@ def safe_str(value):
         return None
 
 
-def describe_function(function, block_model, monitor):
+def body_hash(function, memory):
+    """SHA-256 of the raw bytes covering the function body.
+
+    Returns the hex digest, or None if the body is empty or
+    unreadable (e.g. external/overlay functions with no backing bytes).
+
+    Reads from getMinAddress() for getNumAddresses() bytes. This is
+    correct for contiguous function bodies (the common case on ARM).
+    For non-contiguous bodies the hash covers the full address span
+    including any gaps — acceptable for fingerprinting since the gap
+    bytes are deterministic for a given binary.
+    """
+    body = function.getBody()
+    if body is None:
+        return None
+    nbytes = int(body.getNumAddresses())
+    if nbytes <= 0:
+        return None
+    try:
+        import jpype  # type: ignore — available under PyGhidra
+        buf = jpype.JArray(jpype.JByte)(nbytes)
+        got = memory.getBytes(body.getMinAddress(), buf)
+        if got != nbytes:
+            return None
+        # Convert signed Java bytes to unsigned Python bytes
+        return hashlib.sha256(bytes([b & 0xFF for b in buf])).hexdigest()
+    except Exception:
+        return None
+
+
+def describe_function(function, block_model, monitor, memory):
     entry = function.getEntryPoint()
     body = function.getBody()
 
@@ -79,6 +110,7 @@ def describe_function(function, block_model, monitor):
         "calling_convention": safe_str(cc),
         "basic_block_count": count_basic_blocks(function, block_model, monitor),
         "signature": safe_str(function.getSignature()),
+        "body_hash": body_hash(function, memory),
     }
 
 
@@ -88,12 +120,13 @@ def main():
     function_manager = program.getFunctionManager()
     block_model = BasicBlockModel(program)
     monitor = ConsoleTaskMonitor()
+    memory = program.getMemory()
 
     total = 0
     with open(output_path, "w") as fh:
         for function in function_manager.getFunctions(True):
             try:
-                record = describe_function(function, block_model, monitor)
+                record = describe_function(function, block_model, monitor, memory)
             except Exception as exc:
                 printerr(  # noqa: F821 — Ghidra builtin
                     "export_functions: failed on {}: {}".format(function, exc)

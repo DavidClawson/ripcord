@@ -161,3 +161,131 @@ GROUP BY size, blocks, instructions
 HAVING COUNT(DISTINCT source) > 1
 ORDER BY total_functions DESC, size DESC
 LIMIT 15;
+
+-- 7. NAME-AWARE PRECISION: decompose cross-target clusters by name.
+--
+-- Sections 4-6 group by the feature tuple only. When two different
+-- functions in the same binary share a signature (within-target
+-- twins), the cluster inflates and the name list shows multiple
+-- distinct names — but the cross-target match on each name
+-- individually may still be correct. This query resolves that
+-- ambiguity by sub-grouping: for each (signature, name) pair that
+-- appears in more than one target, that's a confirmed cross-target
+-- name match. Clusters where names disagree across targets are
+-- separated out as collisions.
+--
+-- The summary at the end reports precision = confirmed / (confirmed
+-- + collision), which should be ~100% on the Zephyr pair where the
+-- raw cluster-level metric was ~96%.
+
+-- 7a. Per-name cross-target matches (confirmed)
+CREATE OR REPLACE VIEW name_matches AS
+SELECT
+    name,
+    size, blocks, instructions, out_calls, distinct_callees, reads, writes, jumps,
+    COUNT(DISTINCT source) AS target_count,
+    COUNT(*)               AS total_functions,
+    LIST(DISTINCT source ORDER BY source) AS sources
+FROM feature_vector
+WHERE name NOT LIKE 'FUN_%'   -- exclude Ghidra auto-names (no ground truth)
+GROUP BY name, size, blocks, instructions, out_calls, distinct_callees, reads, writes, jumps
+HAVING COUNT(DISTINCT source) > 1;
+
+-- Show the confirmed matches, largest first
+SELECT name, size, blocks, instructions, target_count, sources
+FROM name_matches
+ORDER BY size DESC
+LIMIT 30;
+
+-- 7b. Within-target collisions: signature tuples that appear in
+-- multiple targets but carry more than one distinct (non-auto) name
+-- across the full cluster. These are the cases the raw §4 query
+-- mis-counts.
+CREATE OR REPLACE VIEW signature_collisions AS
+WITH cross_target_clusters AS (
+    SELECT
+        size, blocks, instructions, out_calls, distinct_callees, reads, writes, jumps,
+        COUNT(DISTINCT source) AS target_count
+    FROM feature_vector
+    GROUP BY size, blocks, instructions, out_calls, distinct_callees, reads, writes, jumps
+    HAVING COUNT(DISTINCT source) > 1
+),
+cluster_names AS (
+    SELECT
+        fv.size, fv.blocks, fv.instructions, fv.out_calls,
+        fv.distinct_callees, fv.reads, fv.writes, fv.jumps,
+        COUNT(DISTINCT CASE WHEN fv.name NOT LIKE 'FUN_%' THEN fv.name END) AS distinct_real_names,
+        LIST(DISTINCT fv.name ORDER BY fv.name)[:6] AS sample_names
+    FROM feature_vector fv
+    INNER JOIN cross_target_clusters c USING (size, blocks, instructions, out_calls, distinct_callees, reads, writes, jumps)
+    GROUP BY fv.size, fv.blocks, fv.instructions, fv.out_calls,
+             fv.distinct_callees, fv.reads, fv.writes, fv.jumps
+)
+SELECT * FROM cluster_names WHERE distinct_real_names > 1;
+
+SELECT * FROM signature_collisions ORDER BY distinct_real_names DESC;
+
+-- 7c. Summary: name-aware precision
+--
+-- confirmed_matches: (signature, name) pairs present in >1 target.
+--   Every one of these is a true positive by construction (same name,
+--   same structural fingerprint, different targets).
+-- collisions: signature tuples that appear in >1 target but carry
+--   multiple distinct real names. These are ambiguous, not wrong —
+--   they need a richer discriminator (byte hash, P-Code) to resolve.
+-- unambiguous_pct: fraction of cross-target signature clusters that
+--   are collision-free (single name across all targets). This is the
+--   "how often can you trust a structural match without further
+--   disambiguation" metric.
+SELECT
+    (SELECT COUNT(*) FROM name_matches)   AS confirmed_matches,
+    (SELECT COUNT(*) FROM signature_collisions) AS collisions,
+    ROUND(
+        100.0 * (SELECT COUNT(*) FROM name_matches)
+        / NULLIF((SELECT COUNT(*) FROM name_matches)
+                 + (SELECT COUNT(*) FROM signature_collisions), 0),
+        1
+    ) AS unambiguous_pct;
+
+-- 8. BODY-HASH DISAMBIGUATION: resolve structural collisions using
+-- the byte-level hash (requires body_hash column in functions table).
+--
+-- For each collision cluster from §7b, check whether the body_hash
+-- can split the ambiguous members into distinct groups. If two
+-- functions share a structural signature but have different hashes,
+-- they are definitively different. If they share both structure and
+-- hash, they are byte-identical (true duplicates or copy-pasted code).
+--
+-- This section is a no-op if body_hash is NULL (pre-hash pipeline run).
+
+-- 8a. Cross-target matches using structure + hash (the gold standard)
+CREATE OR REPLACE VIEW hash_matches AS
+SELECT
+    fv.name,
+    f.body_hash,
+    fv.size, fv.blocks, fv.instructions,
+    COUNT(DISTINCT fv.source) AS target_count,
+    LIST(DISTINCT fv.source ORDER BY fv.source) AS sources
+FROM feature_vector fv
+JOIN functions f ON f.source = fv.source AND f.addr = fv.addr
+WHERE fv.name NOT LIKE 'FUN_%'
+  AND f.body_hash IS NOT NULL
+GROUP BY fv.name, f.body_hash, fv.size, fv.blocks, fv.instructions
+HAVING COUNT(DISTINCT fv.source) > 1;
+
+SELECT name, body_hash[:16] AS hash_prefix, size, blocks, target_count, sources
+FROM hash_matches
+ORDER BY size DESC
+LIMIT 30;
+
+-- 8b. Collision resolution: do any §7b collisions survive when we
+-- add body_hash as a discriminator?
+SELECT
+    sc.size, sc.blocks, sc.instructions,
+    sc.sample_names,
+    COUNT(DISTINCT f.body_hash) AS distinct_hashes
+FROM signature_collisions sc
+JOIN feature_vector fv USING (size, blocks, instructions, out_calls, distinct_callees, reads, writes, jumps)
+JOIN functions f ON f.source = fv.source AND f.addr = fv.addr
+WHERE f.body_hash IS NOT NULL
+GROUP BY sc.size, sc.blocks, sc.instructions, sc.sample_names;
