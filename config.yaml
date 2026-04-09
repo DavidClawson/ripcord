@@ -14,6 +14,7 @@ targets:
     arch: arm
     build_tuple: m0plus-O3-newlib
     source: "pico-sdk/src/rp2_common/pico_blink"
+    svd: targets/_svd/RP2040.svd
 
   zephyr_hello_world:
     elf: targets/zephyr_hello_world/zephyr.elf
@@ -21,6 +22,7 @@ targets:
     arch: arm
     build_tuple: m3-Os-picolibc
     source: "zephyrproject/zephyr/samples/hello_world"
+    svd: targets/_svd/LM3S6965.svd
     scenarios:
       boot:
         resc: scripts/renode/zephyr_hello_boot.resc
@@ -33,6 +35,7 @@ targets:
     arch: arm
     build_tuple: m3-Os-picolibc
     source: "zephyrproject/zephyr/samples/synchronization"
+    svd: targets/_svd/LM3S6965.svd
     scenarios:
       boot:
         resc: scripts/renode/zephyr_sync_boot.resc
@@ -49,6 +52,7 @@ targets:
     arch: arm
     build_tuple: m0plus-O3-newlib
     source: "pico-examples/freertos/hello_freertos"
+    svd: targets/_svd/RP2040.svd
 
   pico_freertos_static:
     elf: targets/pico_freertos_static/hello_freertos_static.elf
@@ -56,6 +60,7 @@ targets:
     arch: arm
     build_tuple: m0plus-O3-newlib
     source: "pico-examples/freertos/hello_freertos (static alloc)"
+    svd: targets/_svd/RP2040.svd
 
   pico_hello_usb:
     elf: targets/pico_hello_usb/hello_usb.elf
@@ -63,6 +68,7 @@ targets:
     arch: arm
     build_tuple: m0plus-O3-newlib
     source: "pico-examples/hello_world/usb"
+    svd: targets/_svd/RP2040.svd
 
   pico_hello_timer:
     elf: targets/pico_hello_timer/hello_timer.elf
@@ -70,6 +76,7 @@ targets:
     arch: arm
     build_tuple: m0plus-O3-newlib
     source: "pico-examples/timer/hello_timer"
+    svd: targets/_svd/RP2040.svd
 
   pico_freertos_hello_stripped:
     elf: targets/pico_freertos_hello_stripped/hello_freertos_stripped.elf
@@ -77,6 +84,7 @@ targets:
     arch: arm
     build_tuple: m0plus-O3-newlib
     source: "pico-examples/freertos/hello_freertos (stripped)"
+    svd: targets/_svd/RP2040.svd
 
   stock_v103:
     elf: targets/stock_v103/stock_v103.bin
@@ -86,6 +94,7 @@ targets:
     source: "FNIRSI manufacturer download"
     raw_binary: true
     base_addr: 0x08004000
+    svd: targets/_svd/AT32F403Axx_v2.svd
 
   stock_v107:
     elf: targets/stock_v107/stock_v107.bin
@@ -95,6 +104,7 @@ targets:
     source: "FNIRSI manufacturer download"
     raw_binary: true
     base_addr: 0x08004000
+    svd: targets/_svd/AT32F403Axx_v2.svd
 
   stock_v112:
     elf: targets/stock_v112/stock_v112.bin
@@ -104,6 +114,7 @@ targets:
     source: "FNIRSI manufacturer download"
     raw_binary: true
     base_addr: 0x08004000
+    svd: targets/_svd/AT32F403Axx_v2.svd
 
   stock_v120:
     elf: targets/stock_v120/stock_v120.bin
@@ -113,6 +124,7 @@ targets:
     source: "FNIRSI manufacturer download"
     raw_binary: true
     base_addr: 0x08004000
+    svd: targets/_svd/AT32F403Axx_v2.svd
 
   at32_hal_blinky:
     elf: targets/at32_hal_blinky/at32_hal_blinky.elf
@@ -120,6 +132,7 @@ targets:
     arch: arm
     build_tuple: m4-O2-nano
     source: "AT32F403A_407_Firmware_Library template (GPIO + CRM + clock + delay)"
+    svd: targets/_svd/AT32F403Axx_v2.svd
 
   at32_freertos_hello:
     elf: targets/at32_freertos_hello/at32_freertos_hello.elf
@@ -127,6 +140,7 @@ targets:
     arch: arm
     build_tuple: m4-O2-nano
     source: "AT32F403A_407_Firmware_Library template + FreeRTOS (4 tasks, heap_4)"
+    svd: targets/_svd/AT32F403Axx_v2.svd
 
   at32_hal_blinky_llvm:
     elf: targets/at32_hal_blinky_llvm/at32_hal_blinky_llvm.elf
@@ -134,6 +148,7 @@ targets:
     arch: arm
     build_tuple: m4-llvm-O2
     source: "AT32F403A_407_Firmware_Library template, LLVM embedded toolchain"
+    svd: targets/_svd/AT32F403Axx_v2.svd
 
   # Uncomment and add entries as you build more targets.
   #

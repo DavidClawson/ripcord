@@ -369,6 +369,47 @@ def recovered_calls_row(rec: dict, source: str, extracted_at) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# peripheral_xrefs — one row per peripheral register access from a function
+# ---------------------------------------------------------------------------
+#
+# Derived from the xrefs table + CMSIS-SVD register maps. Each row is a
+# reference from a function body to a memory-mapped peripheral register.
+# Only includes addresses in vendor peripheral (0x40000000-0x5FFFFFFF),
+# external memory-mapped (0x60000000-0xAFFFFFFF), or Cortex-M system
+# (0xE0000000+) regions. With an SVD file, provides register-level
+# resolution (e.g., USART2.STS); without, classifies Cortex-M system
+# peripherals only.
+
+PERIPHERAL_XREFS_SCHEMA = pa.schema(
+    [
+        ("source", pa.string()),
+        ("function_addr", pa.int64()),
+        ("from_addr", pa.int64()),  # instruction address
+        ("access_addr", pa.int64()),  # peripheral register address
+        ("ref_type", pa.string()),  # READ, WRITE, DATA, PARAM
+        ("peripheral", pa.string()),  # e.g., "USART2"
+        ("register_name", pa.string()),  # e.g., "STS" (empty if no SVD match)
+        ("peripheral_group", pa.string()),  # e.g., "communication"
+        ("extracted_at", pa.timestamp("us", tz="UTC")),
+    ]
+)
+
+
+def peripheral_xrefs_row(rec: dict, source: str, extracted_at) -> dict:
+    return {
+        "source": source,
+        "function_addr": int(rec["function_addr"]),
+        "from_addr": int(rec["from_addr"]),
+        "access_addr": int(rec["access_addr"]),
+        "ref_type": rec.get("ref_type") or "",
+        "peripheral": rec.get("peripheral") or "",
+        "register_name": rec.get("register_name") or "",
+        "peripheral_group": rec.get("peripheral_group") or "",
+        "extracted_at": extracted_at,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Registry
 # ---------------------------------------------------------------------------
 
@@ -382,6 +423,7 @@ TABLES: dict[str, pa.Schema] = {
     "mmio_events": MMIO_EVENTS_SCHEMA,
     "decompiled": DECOMPILED_SCHEMA,
     "recovered_calls": RECOVERED_CALLS_SCHEMA,
+    "peripheral_xrefs": PERIPHERAL_XREFS_SCHEMA,
 }
 
 ROW_TRANSFORMS: dict[str, Callable] = {
@@ -394,4 +436,5 @@ ROW_TRANSFORMS: dict[str, Callable] = {
     "mmio_events": mmio_events_row,
     "decompiled": decompiled_row,
     "recovered_calls": recovered_calls_row,
+    "peripheral_xrefs": peripheral_xrefs_row,
 }

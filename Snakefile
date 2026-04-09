@@ -70,6 +70,7 @@ rule all:
         expand("build/{target}/tables/strings.parquet",      target=TARGETS),
         expand("build/{target}/tables/pcode_features.parquet", target=TARGETS),
         expand("build/{target}/tables/recovered_calls.parquet", target=TARGETS),
+        expand("build/{target}/tables/peripheral_xrefs.parquet", target=TARGETS),
         expand("build/{target}/tables/ground_truth_functions.parquet", target=TARGETS),
         expand("build/{target}/tables/functions_enriched.parquet", target=TARGETS),
         all_renode_outputs(),
@@ -254,6 +255,35 @@ rule recover_calls:
         {PYTHON} scripts/recovery/recover_calls.py {wildcards.target}
         {PYTHON} scripts/ingest/load_table.py \
             --table recovered_calls \
+            --source {wildcards.target} \
+            --output {output.parquet} \
+            {params.jsonl}
+        """
+
+
+rule classify_peripherals:
+    """Classify peripheral register accesses per function using SVD maps.
+
+    Reads the xrefs table, filters to peripheral memory regions
+    (0x40000000+ vendor, 0xE0000000+ system), and resolves each
+    address against the target's SVD register map. Produces
+    peripheral_xrefs.parquet with register-level classification.
+
+    Works with or without an SVD file: with SVD gets full register
+    names (USART2.STS, GPIOA.ODR); without gets Cortex-M system
+    peripherals only (NVIC, SysTick, SCB).
+    """
+    input:
+        xrefs = "build/{target}/tables/xrefs.parquet",
+    output:
+        parquet = "build/{target}/tables/peripheral_xrefs.parquet",
+    params:
+        jsonl = "build/{target}/peripheral_xrefs.jsonl",
+    shell:
+        r"""
+        {PYTHON} scripts/peripheral/classify_peripherals.py {wildcards.target}
+        {PYTHON} scripts/ingest/load_table.py \
+            --table peripheral_xrefs \
             --source {wildcards.target} \
             --output {output.parquet} \
             {params.jsonl}

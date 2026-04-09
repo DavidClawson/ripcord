@@ -4,6 +4,7 @@
 targets/*
 !targets/README.md
 !targets/.gitkeep
+!targets/_svd/
 
 # Pipeline outputs — always regeneratable from inputs
 build/
