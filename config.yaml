@@ -128,6 +128,13 @@ targets:
     build_tuple: m4-O2-nano
     source: "AT32F403A_407_Firmware_Library template + FreeRTOS (4 tasks, heap_4)"
 
+  at32_hal_blinky_llvm:
+    elf: targets/at32_hal_blinky_llvm/at32_hal_blinky_llvm.elf
+    description: "AT32F403A HAL blinky, Cortex-M4, LLVM clang 19.1.5 -O2"
+    arch: arm
+    build_tuple: m4-llvm-O2
+    source: "AT32F403A_407_Firmware_Library template, LLVM embedded toolchain"
+
   # Uncomment and add entries as you build more targets.
   #
   # arduino_uno_blink:
