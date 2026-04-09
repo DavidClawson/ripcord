@@ -114,6 +114,20 @@ targets:
     raw_binary: true
     base_addr: 0x08004000
 
+  at32_hal_blinky:
+    elf: targets/at32_hal_blinky/at32_hal_blinky.elf
+    description: "AT32F403A HAL blinky, Cortex-M4, arm-none-eabi-gcc -O2, nano.specs"
+    arch: arm
+    build_tuple: m4-O2-nano
+    source: "AT32F403A_407_Firmware_Library template (GPIO + CRM + clock + delay)"
+
+  at32_freertos_hello:
+    elf: targets/at32_freertos_hello/at32_freertos_hello.elf
+    description: "AT32F403A HAL + FreeRTOS, Cortex-M4, arm-none-eabi-gcc -O2, nano.specs"
+    arch: arm
+    build_tuple: m4-O2-nano
+    source: "AT32F403A_407_Firmware_Library template + FreeRTOS (4 tasks, heap_4)"
+
   # Uncomment and add entries as you build more targets.
   #
   # arduino_uno_blink:

@@ -115,7 +115,7 @@ rule ghidra_extract:
     shell:
         r"""
         mkdir -p {params.project_dir} $(dirname {output.functions_jsonl})
-        {GHIDRA_PYGHIDRA} -H {params.project_dir} {params.project_name} \
+        env -u VIRTUAL_ENV {GHIDRA_PYGHIDRA} -H {params.project_dir} {params.project_name} \
             -import {input.elf} \
             -overwrite \
             -scriptPath {params.script_path} \
