@@ -60,6 +60,13 @@ The warehouse is a tree of Parquet files, not an embedded DB file
 | `pico_freertos_hello_stripped`  | Cortex-M0+  | stripped `pico_freertos_hello` | 197 | 590 | 2574 | 3818 | 19 | 188 |
 | `zephyr_hello_world`            | Cortex-M3   | Zephyr, -Os, picolibc   | 110 | 154   | 619  | 970   | 42      | 90    |
 | `zephyr_synchronization`        | Cortex-M3   | Zephyr, -Os, picolibc   | 130 | 193   | 714  | 1110  | 46      | 108   |
+| `at32_hal_blinky`               | Cortex-M4   | AT32 SDK, GCC -O2, nano | 51  | 54    | 175  | 325   | 1       | 37    |
+| `at32_freertos_hello`           | Cortex-M4   | AT32 SDK + FreeRTOS, GCC -O2 | 133 | 211 | 671  | 1157  | 10      | 113   |
+| `at32_hal_blinky_llvm`          | Cortex-M4   | AT32 SDK, LLVM 19 -O2  | 44  | 49    | 185  | 265   | 1       | 31    |
+| `stock_v103`                    | Cortex-M4   | FNIRSI V1.0.3, Keil    | 269 | —     | —    | —     | —       | —     |
+| `stock_v107`                    | Cortex-M4   | FNIRSI V1.0.7, Keil    | 287 | —     | —    | —     | —       | —     |
+| `stock_v112`                    | Cortex-M4   | FNIRSI V1.1.2, Keil    | 306 | —     | —    | —     | —       | —     |
+| `stock_v120`                    | Cortex-M4   | FNIRSI V1.2.0, Keil    | 305 | —     | —    | —     | —       | —     |
 
 Additionally, `zephyr_hello_world` has 394 MMIO events from a 2s
 Renode boot trace.
@@ -67,21 +74,54 @@ Renode boot trace.
 Five Pico targets share a build config (M0+, -O3, newlib); one is
 the stripped variant of `pico_freertos_hello` (blind recovery test
 target, no symbols). Two Zephyr targets share a different build
-config (M3, -Os, picolibc).
+config (M3, -Os, picolibc). Three AT32F403A targets test the stock
+firmware's chip family with GCC and LLVM compilers. Four stock
+firmware versions span V1.0.3-V1.2.0 (raw binary imports).
 
 ### Key empirical findings (newest first)
 
-1. **Computed call recovery closes the reachability gap from 70%
+1. **Multi-signal cross-compiler matching works.** Weighted
+   combination of 7 signals (size, blocks, calls, peripheral
+   addresses, strings, body hash, read/write pattern) identifies
+   functions across different compilers where single-signal matching
+   fails. First result: 6 high-confidence FreeRTOS matches in the
+   stock Keil firmware from GCC reference builds
+   (prvPortStartFirstTask, nvic_priority_group_config,
+   xTaskResumeAll, vTaskDelay, prvIdleTask, xTaskCreate). See
+   `notes/queries/multi_signal_score.sql`.
+
+2. **Constant-based fingerprinting: 100% precision, cross-compiler.**
+   Three signals — peripheral register sets, full constant sets,
+   string references — all achieve 100% precision. Constant sets
+   correctly identify 82 functions in blind recovery on stripped
+   binary. String matching tracks functions across stock firmware
+   versions (FAT32 handler, BSP init, printf formatter). See
+   `notes/queries/constant_fingerprint.sql`.
+
+3. **Computed call recovery closes the reachability gap from 70%
    unreachable to 12%.** Five recovery mechanisms (vector table,
    binary constant scan, xref-based func-ptr refs, veneer jumps,
-   registrar dispatch inference) recover 67-188 edges per target.
-   On `pico_freertos_hello`: 212/265 functions reachable from
-   `main` (80.0%, up from 30.6%); only 32 truly unreachable from
-   all entry points (12.1%). Works on stripped binaries. See
-   `scripts/recovery/recover_calls.py` and
-   `notes/queries/recovered_calls.sql`.
+   registrar dispatch inference) recover 46-234 edges per target
+   at ~95% blended precision. On `pico_freertos_hello`: 211/265
+   functions reachable from `main` (79.6%, up from 30.6%); only
+   32 truly unreachable from all entry points (12.1%). Works on
+   stripped binaries and raw binary imports. See
+   `scripts/recovery/recover_calls.py`.
 
-2. **Blind recovery on stripped binary: 86.6% recall, 94.9%
+4. **P-Code histogram cosine similarity fails cross-ISA.** 92% of
+   all cross-ISA pairs score >= 0.80 — no discrimination. The
+   histogram is dominated by ubiquitous opcodes (COPY, INT_ADD,
+   LOAD). Path killed; cross-ISA needs TF-IDF, multi-feature, or
+   learned embeddings. See `notes/queries/pcode_cosine.sql`.
+
+5. **AT32F403A reference corpus confirms stock firmware uses
+   FreeRTOS.** `vPortEnableVFP` byte-identical match between GCC
+   reference and stock V1.2.0 confirms the ARM_CM4F FreeRTOS port.
+   LLVM builds produce different code from both GCC and Keil —
+   cross-compiler matching requires multi-signal scoring, not
+   exact match.
+
+6. **Blind recovery on stripped binary: 86.6% recall, 94.9%
    precision.** `pico_freertos_hello_stripped` (symbols removed)
    was matched against the full-symbol `pico_freertos_hello` and
    `pico_freertos_static` using structural 8-tuple + body_hash.
@@ -91,34 +131,18 @@ config (M3, -Os, picolibc).
    expected failure mode. This is the first end-to-end blind
    recovery demonstration.
 
-3. **P-Code cross-ISA: exact hash fails, within-ISA works
-   (93-100%), histogram similarity is the path forward.** Exact
-   `pcode_sequence_hash` matching across Cortex-M0+ vs Cortex-M3
-   produces zero true positives — register allocation and calling
-   conventions differ enough to change P-Code lowerings. Within the
-   same ISA, pcode hash matching achieves 93-94% precision at
-   ops >= 50. The path to cross-ISA matching is through P-Code
-   opcode histogram cosine similarity, not exact hashes. See
-   `notes/queries/cross_isa_pcode.sql`.
+7. **P-Code within-ISA: 93-94% precision at ops >= 50.** Exact
+   `pcode_sequence_hash` works within-ISA but fails cross-ISA
+   (zero true positives). Histogram cosine also fails cross-ISA
+   (finding #4). Within-ISA, P-Code hash is a strong signal for
+   same-compiler matching. See `notes/queries/cross_isa_pcode.sql`.
 
-4. **Renode traces: 394 MMIO events from 2s boot, function-to-MMIO
-   correlation working.** Renode v1.16.1 boots `zephyr_hello_world`
-   on a custom LM3S6965 platform file. The execution trace captures
-   per-instruction MMIO reads/writes with PC attribution. 214
-   UART0 events, 154 NVIC events. The `mmio_events` table is in
-   the warehouse and joinable to `functions` by PC. See
+8. **Renode traces: 394 MMIO events from 2s boot.** Renode v1.16.1
+   boots `zephyr_hello_world` on custom LM3S6965 platform. The
+   `mmio_events` table is joinable to `functions` by PC. See
    `notes/renode-setup.md`.
 
-5. **Datalog reachability with recovered edges: 80% reachable from
-   main.** Souffle reachability on `pico_freertos_hello` with
-   static + recovered call edges: 212/265 functions reachable from
-   `main` (80.0%). Only 32 truly unreachable from all entry points
-   (12.1%). The remaining unreachable functions are genuine leaf
-   callbacks (math shims, unused vtable entries). See
-   `notes/datalog-baseline.md` and
-   `scripts/recovery/recover_calls.py`.
-
-6. **Phase 1 library-ID works end-to-end.** Structural matching
+9. **Phase 1 library-ID works end-to-end.** Structural matching
    between `pico_freertos_hello` and `pico_freertos_static` finds
    173 cross-target matches; 105 of those are FreeRTOS-specific.
    The pipeline answers "which functions in this binary are
@@ -128,44 +152,40 @@ config (M3, -Os, picolibc).
    `body_hash` column (SHA-256 of raw function bytes) achieves 100%
    disambiguation on all structural twins from the Zephyr baseline.
 
-8. **Structural fingerprinting works at ~96% cluster-level precision
-   under same-build conditions.** See
-   `notes/fingerprinting-baseline.md`.
+10. **Structural fingerprinting works at ~96% cluster-level
+    precision under same-build conditions.** See
+    `notes/fingerprinting-baseline.md`.
 
-9. **"Same toolchain" is too weak a hypothesis for cross-target
-   matching.** The correct condition is matching (ISA, -O, libc,
-   link surface). Validates D9 (P-Code, not disassembly).
-
-10. **Ghidra's extraction is 100% complete with respect to real
+11. **Ghidra's extraction is 100% complete with respect to real
     function bodies on both test ISAs.** See
     `notes/ghidra-extraction-notes.md`.
 
-11. **Parquet-as-truth storage was the right call.** Adding targets
+12. **Parquet-as-truth storage was the right call.** Adding targets
     is config-only (zero code changes). See design-decisions §D15.
 
 ### Current session's recommended next move
 
-**P-Code histogram cosine similarity for cross-ISA matching.** The
-exact pcode_sequence_hash fails cross-ISA (finding #3 above), but
-the opcode histogram (already in `pcode_features`) captures the
-distribution of P-Code operations without caring about order or
-register allocation. Computing cosine similarity between histograms
-across the Pico/Zephyr divide is the next empirical test — it will
-either validate or kill the P-Code histogram path before investing
-in learned embeddings.
+**Peripheral-semantic function classification.** Using xrefs and a
+chip register map (SVD or manual), automatically classify every
+function by the peripherals it accesses (SPI driver, UART handler,
+DMA config, GPIO setup). Works on any Cortex-M target without
+reference builds. Would complement the multi-signal scorer by
+adding a hardware-semantic layer.
 
-After that, two parallel threads:
+After that, three parallel threads:
 
-- **Snakemake integration for Renode + Datalog.** Both tools work
-  standalone; wiring them into the pipeline DAG makes them
-  reproducible and cacheable. Renode depends on a `.resc` scenario
-  file per (target, scenario); Datalog depends on `calls` +
-  `functions` + `recovered_calls` tables.
-- **Stock firmware recovery improvement.** The `recovered_calls`
-  pipeline currently finds 0 edges on raw binary stock firmware
-  because Ghidra's raw import misses vector table functions. Next
-  step: feed vector table addresses back to Ghidra as function
-  creation hints during import.
+- **Expand the multi-signal scorer** into a standalone tool that
+  takes a reference ELF + target binary and produces a ranked
+  identification report. Current version is a SQL query; a Python
+  wrapper would make it usable in the agent swarm and the
+  interactive REPL.
+- **Ghidra import enhancement for raw binaries.** Feed vector table
+  addresses as function creation hints during import. Would improve
+  stock firmware function discovery (currently 305 functions; vector
+  table shows 20+ undiscovered entry points).
+- **Agent swarm dry run.** The Phase 3 infrastructure exists but
+  hasn't been exercised end-to-end. Running it on
+  `pico_freertos_hello` (ground truth) would validate the loop.
 
 ## Non-goals and constraints (read carefully)
 
@@ -371,6 +391,10 @@ and why. Run any of them with `scripts/query < notes/queries/<file>.sql`.
 | `cross_isa_pcode.sql`        | Cross-ISA P-Code sequence hash matching. Tests D9 empirically: exact hash fails cross-ISA (M0+ vs M3), works within-ISA at 93-94% precision for ops >= 50. Demonstrates that histogram similarity is the path forward. |
 | `state_structure.sql`        | FNIRSI 2C53T global state structure (0x200000F8) access analysis: per-offset READ/WRITE xrefs, scope-critical preset bytes (+0xF68..+0xF6B), writer->reader data flow, USART2 peripheral access. See `notes/state_structure_analysis.md`. |
 | `recovered_calls.sql`        | Recovered call-edge analysis: per-target mechanism summary, vector table entries, reachability improvement (static-only vs static+recovered). |
+| `recovery_precision.sql`     | Precision measurement per recovery mechanism: vector_table/veneer/func_ptr/binary_const at 95-100%, registrar_dispatch at 89.5%. |
+| `pcode_cosine.sql`           | P-Code histogram cosine similarity cross-ISA test. Negative result: 92% of pairs score >= 0.80, no discrimination. |
+| `constant_fingerprint.sql`   | Constant-based fingerprinting: peripheral sets, full constant sets, string references. 100% precision on all three signals. |
+| `multi_signal_score.sql`     | Cross-compiler function matching via weighted 7-signal similarity. The cross-compiler identification unlock. |
 | `osc_peripheral_map.sql`     | AT32F403A peripheral register access map for stock firmware. Classifies all MMIO xrefs by peripheral block, ranks by access count, identifies multi-peripheral init/driver functions. |
 | `osc_version_diff.sql`       | Cross-version comparison across all four stock firmware versions (V1.0.3-V1.2.0). Size evolution, byte-identical functions, changed/added/removed functions, version-to-version stability matrix. |
 | `osc_scope_path.sql`         | Scope acquisition call tree: reverse call graph from FPGA-facing peripherals (USART2, SPI3, DMA, FSMC/LCD). Also identifies ADC accessor functions. |

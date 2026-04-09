@@ -6,35 +6,41 @@ practice.
 
 ## Status snapshot (2026-04-08)
 
-**Phase 0:** ✅ complete. Eight targets in warehouse (5 Pico + 2
-Zephyr + 1 stripped blind-recovery target), up to eight table types
-per target (`functions` with `body_hash`, `calls`, `basic_blocks`,
-`xrefs`, `strings`, `pcode_features`, `mmio_events`,
-`ground_truth_functions`). See `CLAUDE.md` for the live numbers.
+**Phase 0:** ✅ complete. 15 targets in warehouse (5 Pico + 2
+Zephyr + 1 stripped + 4 stock FNIRSI + 3 AT32 reference), nine
+table types per target (`functions`, `calls`, `basic_blocks`,
+`xrefs`, `strings`, `pcode_features`, `recovered_calls`,
+`mmio_events`, `ground_truth_functions`).
 
-**Phase 1:** library-ID validated end-to-end including blind
-recovery. Structural fingerprinting identifies 173 cross-target
-matches between two Pico-FreeRTOS targets (105 FreeRTOS-specific).
-Blind recovery on stripped binary: 86.6% recall, 94.9% precision.
-P-Code extraction working on all 8 targets; exact hash matching
-works within-ISA (93-94% precision at ops >= 50), fails cross-ISA.
-Confidence scoring scheme designed (`notes/confidence-scheme.md`).
+**Phase 1:** library-ID validated end-to-end with multiple matching
+signals. Structural fingerprinting: 96% precision same-build. Blind
+recovery: 86.6% recall, 94.9% precision. P-Code: within-ISA 93-94%,
+cross-ISA fails (histogram cosine tested and killed). Constant
+fingerprinting: 100% precision, cross-compiler. Multi-signal
+cross-compiler scoring: 6 high-confidence FreeRTOS matches in stock
+Keil firmware from GCC reference builds. AT32F403A reference corpus
+built (GCC + LLVM). `vPortEnableVFP` byte-identical match confirms
+stock firmware uses FreeRTOS ARM_CM4F GCC port.
 
-**Phase 1 §1.3 (Renode):** proven standalone. Renode boots
-`zephyr_hello_world` on custom LM3S6965 platform; 394 MMIO events
-from 2s boot captured in `mmio_events` table. Not yet wired into
-Snakemake. See `notes/renode-setup.md`.
+**Computed call recovery:** 5 mechanisms at ~95% blended precision.
+Reachability gap: 70% unreachable → 12% truly unreachable. Works on
+ELF, stripped, and raw binary targets. Stock firmware: 37-47 edges
+including undiscovered vector table entry points.
 
-**Phase 2 §2.1 (Datalog):** proven standalone. Souffle reachability
-derivation on `pico_freertos_hello`: 80/265 functions reachable
-from `main`, 20 orchestrators identified, subsystem clusters
-extracted. DuckDB recursive CTE equivalent in
-`notes/queries/reachability.sql`. Not yet wired into Snakemake.
-See `notes/datalog-baseline.md`.
+**Phase 1 §1.3 (Renode):** proven standalone + wired into Snakemake.
+Renode boots Zephyr targets; 394 MMIO events from 2s boot. DAG
+verified clean.
 
-**Phases 2.2+, 3+:** not started. Deferred until Snakemake
-integration of Renode and Datalog, and cross-ISA histogram
-similarity is tested.
+**Phase 2 §2.1 (Datalog):** proven standalone + wired into Snakemake
+with recovered call edges. Souffle reachability on
+`pico_freertos_hello`: 211/265 reachable from `main` (79.6%) with
+recovery edges.
+
+**Phase 3 (Agent swarm):** infrastructure built (task queue, context
+assembly, worker, validation) but not exercised end-to-end on a real
+target.
+
+**Phases 2.2+ (angr), 4 (Unicorn verification):** not started.
 
 ## Phase 0 — Bootstrapping (days, not weeks) ✅ COMPLETE
 
@@ -498,38 +504,49 @@ Things that are tempting but should wait:
 
 ## Highest-leverage single action right now (updated 2026-04-08)
 
-**P-Code histogram cosine similarity for cross-ISA matching.** The
-`pcode_features` table already contains opcode histograms for all 8
-targets. Exact sequence hashes fail cross-ISA but work within-ISA.
-The histogram captures opcode distribution without order/register
-dependence — computing cosine similarity between Pico (M0+) and
-Zephyr (M3) histograms is the cheapest test of whether P-Code
-features can bridge the ISA gap. This is a single SQL query or
-short Python script, ~30 minutes of work.
+**Peripheral-semantic function classification.** Using xrefs + a
+chip register map (SVD file or manual JSON), classify every function
+by the hardware peripherals it accesses. This works on any Cortex-M
+target without reference builds and provides the most immediately
+useful output for firmware RE: "this function is an SPI driver,"
+"this function configures DMA," etc. The data is already in the
+warehouse; the missing piece is a peripheral register map per chip.
 
 After that, three parallel threads:
 
-- **Snakemake integration for Renode + Datalog.** Both tools work
-  standalone (see `notes/renode-setup.md` and
-  `notes/datalog-baseline.md`). Wiring them into the Snakefile
-  makes them reproducible and cacheable. Renode needs a `.resc`
-  per (target, scenario); Datalog needs `calls` + `functions`.
+- **Productize the multi-signal scorer.** Wrap
+  `notes/queries/multi_signal_score.sql` in a Python tool that
+  takes reference + target and produces a ranked identification
+  report. Integrate into the agent swarm and interactive REPL.
 
-- **Computed call target recovery.** The Datalog baseline shows 70%
-  of functions are unreachable from `main` — almost all ISR
-  handlers and FreeRTOS tasks passed as function pointers to
-  `xTaskCreate`. Recovering these edges (from xrefs, constant
-  propagation, or Renode traces) would dramatically improve
-  call-graph completeness.
+- **Ghidra import enhancement for raw binaries.** Feed vector table
+  addresses as function creation hints. Stock firmware currently has
+  305 Ghidra-discovered functions but 20+ undiscovered ISR handlers
+  visible in the vector table.
 
-- **Agent task schema design (Phase 3 prep).** The warehouse is
-  rich enough to support agent work. Designing the task schema is
-  the prerequisite for the Phase 3 worker loop.
+- **Agent swarm dry run.** Validate the Phase 3 infrastructure
+  end-to-end on `pico_freertos_hello` (ground truth available).
+
+**Done this session (2026-04-08):**
+
+- ~~P-Code histogram cosine cross-ISA~~ → killed. 92% of pairs
+  score >= 0.80, no discrimination. See `pcode_cosine.sql`.
+- ~~Computed call recovery~~ → 70% unreachable → 12%. Five
+  mechanisms at ~95% precision. See `recover_calls.py`.
+- ~~Constant fingerprinting~~ → 100% precision, cross-compiler.
+  See `constant_fingerprint.sql`.
+- ~~Multi-signal cross-compiler scoring~~ → 6 high-confidence
+  FreeRTOS matches in stock Keil firmware. The cross-compiler
+  unlock. See `multi_signal_score.sql`.
+- ~~AT32 reference corpus~~ → GCC + LLVM builds, vPortEnableVFP
+  byte-identical match confirms FreeRTOS in stock firmware.
+- ~~Registrar dispatch precision fix~~ → 7.3% → 89.5%.
+- ~~Recovery precision audit~~ → 4 mechanisms at 95-100%, 1 fixed.
+- ~~Snakemake DAG verification~~ → clean, all chains correct.
+- ~~Stock firmware recovery~~ → 0 → 37-47 edges per version.
 
 **Done in previous sessions (preserved for history):**
 
-- ~~P-Code cross-ISA test~~ (2026-04-08). Exact hash fails cross-ISA,
-  works within-ISA at 93-94%. Histogram similarity is the path.
 - ~~Blind recovery experiment~~ (2026-04-08). Stripped binary: 86.6%
   recall, 94.9% precision. First end-to-end blind ID demo.
 - ~~Renode trace capture~~ (2026-04-08). 394 MMIO events from 2s
