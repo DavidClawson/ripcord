@@ -12,26 +12,105 @@ targets:
     elf: targets/pico_blinky/blink.elf
     description: "Raspberry Pi Pico SDK blinky example, Cortex-M0+, bare metal"
     arch: arm
+    build_tuple: m0plus-O3-newlib
     source: "pico-sdk/src/rp2_common/pico_blink"
 
   zephyr_hello_world:
     elf: targets/zephyr_hello_world/zephyr.elf
     description: "Zephyr hello_world sample on qemu_cortex_m3 (TI LM3S6965)"
     arch: arm
+    build_tuple: m3-Os-picolibc
     source: "zephyrproject/zephyr/samples/hello_world"
+    scenarios:
+      boot:
+        resc: scripts/renode/zephyr_hello_boot.resc
+        repl: scripts/renode/lm3s6965.repl
+        duration: "0:0:2"
 
   zephyr_synchronization:
     elf: targets/zephyr_synchronization/zephyr.elf
     description: "Zephyr synchronization sample (two threads, semaphores) on qemu_cortex_m3"
     arch: arm
+    build_tuple: m3-Os-picolibc
     source: "zephyrproject/zephyr/samples/synchronization"
+    scenarios:
+      boot:
+        resc: scripts/renode/zephyr_sync_boot.resc
+        repl: scripts/renode/lm3s6965.repl
+        duration: "0:0:5"
+      steady:
+        resc: scripts/renode/zephyr_sync_steady.resc
+        repl: scripts/renode/lm3s6965.repl
+        duration: "0:0:20"
+
+  pico_freertos_hello:
+    elf: targets/pico_freertos_hello/hello_freertos.elf
+    description: "Pico SDK + FreeRTOS hello_freertos (one core), Cortex-M0+, -O3, newlib"
+    arch: arm
+    build_tuple: m0plus-O3-newlib
+    source: "pico-examples/freertos/hello_freertos"
+
+  pico_freertos_static:
+    elf: targets/pico_freertos_static/hello_freertos_static.elf
+    description: "Pico SDK + FreeRTOS static allocation variant, Cortex-M0+, -O3, newlib"
+    arch: arm
+    build_tuple: m0plus-O3-newlib
+    source: "pico-examples/freertos/hello_freertos (static alloc)"
+
+  pico_hello_usb:
+    elf: targets/pico_hello_usb/hello_usb.elf
+    description: "Pico SDK hello_world USB CDC example, Cortex-M0+, -O3, newlib + TinyUSB"
+    arch: arm
+    build_tuple: m0plus-O3-newlib
+    source: "pico-examples/hello_world/usb"
+
+  pico_hello_timer:
+    elf: targets/pico_hello_timer/hello_timer.elf
+    description: "Pico SDK timer hello example, Cortex-M0+, -O3, newlib"
+    arch: arm
+    build_tuple: m0plus-O3-newlib
+    source: "pico-examples/timer/hello_timer"
+
+  pico_freertos_hello_stripped:
+    elf: targets/pico_freertos_hello_stripped/hello_freertos_stripped.elf
+    description: "Stripped pico_freertos_hello — blind recovery test target"
+    arch: arm
+    build_tuple: m0plus-O3-newlib
+    source: "pico-examples/freertos/hello_freertos (stripped)"
+
+  stock_v103:
+    elf: targets/stock_v103/stock_v103.bin
+    description: "FNIRSI 2C53T stock firmware V1.0.3"
+    arch: arm
+    build_tuple: m4-keil-O2
+    source: "FNIRSI manufacturer download"
+    raw_binary: true
+
+  stock_v107:
+    elf: targets/stock_v107/stock_v107.bin
+    description: "FNIRSI 2C53T stock firmware V1.0.7"
+    arch: arm
+    build_tuple: m4-keil-O2
+    source: "FNIRSI manufacturer download"
+    raw_binary: true
+
+  stock_v112:
+    elf: targets/stock_v112/stock_v112.bin
+    description: "FNIRSI 2C53T stock firmware V1.1.2"
+    arch: arm
+    build_tuple: m4-keil-O2
+    source: "FNIRSI manufacturer download"
+    raw_binary: true
+
+  stock_v120:
+    elf: targets/stock_v120/stock_v120.bin
+    description: "FNIRSI 2C53T stock firmware V1.2.0, AT32F403A Cortex-M4, Keil MDK"
+    arch: arm
+    build_tuple: m4-keil-O2
+    source: "FNIRSI manufacturer download"
+    raw_binary: true
 
   # Uncomment and add entries as you build more targets.
-  #
-  # pico_freertos_blinky:
-  #   elf: targets/pico_freertos_blinky/blink_freertos.elf
-  #   description: "Pico SDK + FreeRTOS blinky"
-  #   arch: arm
   #
   # arduino_uno_blink:
   #   elf: targets/arduino_uno_blink/Blink.ino.elf

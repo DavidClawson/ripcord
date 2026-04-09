@@ -10,9 +10,9 @@
 # notes/design-decisions.md §D15 for the rationale.
 #
 # Usage:
-#   snakemake --cores 4          # run full pipeline
-#   snakemake --cores 4 -n       # dry run, show DAG
-#   snakemake clean              # remove all build outputs
+#   snakemake --cores 4 --resources ghidra=1    # run full pipeline
+#   snakemake --cores 4 --resources ghidra=1 -n # dry run, show DAG
+#   snakemake clean                             # remove all build outputs
 #
 # Environment variables honored:
 #   GHIDRA_PYGHIDRA   path to pyghidraRun if not on $PATH (modern Ghidra
@@ -26,10 +26,39 @@ from pathlib import Path
 configfile: "config.yaml"
 
 GHIDRA_PYGHIDRA = os.environ.get("GHIDRA_PYGHIDRA", "pyghidraRun")
-PYTHON = os.environ.get("PYTHON", "python3")
+PYTHON = os.environ.get("PYTHON", "uv run python")
+RENODE = os.environ.get("RENODE", "/Applications/Renode.app/Contents/MacOS/renode")
+SOUFFLE = os.environ.get("SOUFFLE", "souffle")
 
 TARGETS = list(config["targets"].keys())
 REPO_ROOT = Path(workflow.basedir).resolve()
+
+
+def targets_with_scenarios():
+    """Return targets that have at least one Renode scenario configured."""
+    return [t for t in TARGETS if "scenarios" in config["targets"][t]]
+
+
+def scenarios_for_target(target):
+    """Return the scenarios dict for a target, or empty dict."""
+    return config["targets"][target].get("scenarios", {})
+
+
+def all_renode_outputs():
+    """Expand Renode trace + MMIO parquet outputs for all (target, scenario) pairs."""
+    outputs = []
+    for t in targets_with_scenarios():
+        for s in scenarios_for_target(t):
+            outputs.append(f"build/{t}/tables/mmio_events_{s}.parquet")
+    return outputs
+
+
+def all_datalog_outputs():
+    """Expand Datalog derived outputs for all targets."""
+    outputs = []
+    for t in TARGETS:
+        outputs.append(f"build/{t}/datalog/reaches.csv")
+    return outputs
 
 
 rule all:
@@ -39,7 +68,11 @@ rule all:
         expand("build/{target}/tables/basic_blocks.parquet", target=TARGETS),
         expand("build/{target}/tables/xrefs.parquet",        target=TARGETS),
         expand("build/{target}/tables/strings.parquet",      target=TARGETS),
+        expand("build/{target}/tables/pcode_features.parquet", target=TARGETS),
         expand("build/{target}/tables/ground_truth_functions.parquet", target=TARGETS),
+        expand("build/{target}/tables/functions_enriched.parquet", target=TARGETS),
+        all_renode_outputs(),
+        all_datalog_outputs(),
 
 
 rule ghidra_extract:
@@ -59,12 +92,15 @@ rule ghidra_extract:
     """
     input:
         elf = lambda wc: config["targets"][wc.target]["elf"],
+    resources:
+        ghidra=1,
     output:
         functions_jsonl    = "build/{target}/functions.jsonl",
         calls_jsonl        = "build/{target}/calls.jsonl",
         basic_blocks_jsonl = "build/{target}/basic_blocks.jsonl",
         xrefs_jsonl        = "build/{target}/xrefs.jsonl",
         strings_jsonl      = "build/{target}/strings.jsonl",
+        pcode_jsonl        = "build/{target}/pcode.jsonl",
     params:
         project_dir = lambda wc: f"build/{wc.target}/ghidra_project",
         project_name = lambda wc: wc.target,
@@ -74,6 +110,7 @@ rule ghidra_extract:
         basic_blocks_out = lambda wc: str((REPO_ROOT / f"build/{wc.target}/basic_blocks.jsonl").resolve()),
         xrefs_out        = lambda wc: str((REPO_ROOT / f"build/{wc.target}/xrefs.jsonl").resolve()),
         strings_out      = lambda wc: str((REPO_ROOT / f"build/{wc.target}/strings.jsonl").resolve()),
+        pcode_out        = lambda wc: str((REPO_ROOT / f"build/{wc.target}/pcode.jsonl").resolve()),
     shell:
         r"""
         mkdir -p {params.project_dir} $(dirname {output.functions_jsonl})
@@ -85,12 +122,14 @@ rule ghidra_extract:
             -postScript export_calls.py         {params.calls_out} \
             -postScript export_basic_blocks.py  {params.basic_blocks_out} \
             -postScript export_xrefs.py         {params.xrefs_out} \
-            -postScript export_strings.py       {params.strings_out}
+            -postScript export_strings.py       {params.strings_out} \
+            -postScript export_pcode.py         {params.pcode_out}
         test -s {output.functions_jsonl}
         test -s {output.calls_jsonl}
         test -s {output.basic_blocks_jsonl}
         test -s {output.xrefs_jsonl}
         test -s {output.strings_jsonl}
+        test -s {output.pcode_jsonl}
         """
 
 
@@ -174,6 +213,22 @@ rule ingest_strings:
         """
 
 
+rule ingest_pcode:
+    """Load one target's P-Code feature JSONL into a typed Parquet table."""
+    input:
+        jsonl = "build/{target}/pcode.jsonl",
+    output:
+        parquet = "build/{target}/tables/pcode_features.parquet",
+    shell:
+        r"""
+        {PYTHON} scripts/ingest/load_table.py \
+            --table pcode_features \
+            --source {wildcards.target} \
+            --output {output.parquet} \
+            {input.jsonl}
+        """
+
+
 rule ground_truth_functions:
     """Extract ground-truth text symbols from the ELF via `nm -S`.
 
@@ -195,6 +250,134 @@ rule ground_truth_functions:
             --arch {params.arch} \
             --source {wildcards.target} \
             --output {output.parquet}
+        """
+
+
+rule fingerprint_writeback:
+    """Write structural fingerprint matches back as enriched function tables.
+
+    Runs after all per-target ingest rules complete. Reads all targets'
+    parquet tables, computes cross-target structural matches within
+    build-tuple groups, and writes functions_enriched.parquet per target.
+    """
+    input:
+        functions    = expand("build/{target}/tables/functions.parquet",    target=TARGETS),
+        calls        = expand("build/{target}/tables/calls.parquet",        target=TARGETS),
+        basic_blocks = expand("build/{target}/tables/basic_blocks.parquet", target=TARGETS),
+        xrefs        = expand("build/{target}/tables/xrefs.parquet",        target=TARGETS),
+    output:
+        expand("build/{target}/tables/functions_enriched.parquet", target=TARGETS),
+    shell:
+        r"""
+        {PYTHON} scripts/ingest/write_back_fingerprints.py \
+            --config config.yaml \
+            --build-dir build
+        """
+
+
+rule renode_trace:
+    """Run a Renode scenario to produce an execution trace with MMIO events.
+
+    Only runs for targets that have scenarios configured in config.yaml.
+    Generates a temporary .resc wrapper that parameterizes the ELF path
+    and trace output location, then invokes Renode headless.
+    """
+    input:
+        elf = lambda wc: config["targets"][wc.target]["elf"],
+        resc = lambda wc: config["targets"][wc.target]["scenarios"][wc.scenario]["resc"],
+        repl = lambda wc: config["targets"][wc.target]["scenarios"][wc.scenario]["repl"],
+    output:
+        trace = "build/{target}/traces/{scenario}.trace",
+        log = "build/{target}/traces/{scenario}.log",
+    params:
+        duration = lambda wc: config["targets"][wc.target]["scenarios"][wc.scenario].get("duration", "0:0:2"),
+    shell:
+        r"""
+        mkdir -p $(dirname {output.trace})
+        # Generate a parameterized .resc wrapper so we control output paths
+        WRAPPER=$(mktemp /tmp/renode_XXXXXX.resc)
+        cat > "$WRAPPER" <<RESC
+mach create
+machine LoadPlatformDescription @{input.repl}
+sysbus LoadELF @{input.elf}
+showAnalyzer uart0
+logLevel -1 sysbus
+logFile $CWD/{output.log} true
+cpu CreateExecutionTracing "tracer" $CWD/{output.trace} PCAndOpcode
+tracer TrackMemoryAccesses
+emulation RunFor "{params.duration}"
+quit
+RESC
+        {RENODE} --disable-xwt --console "$WRAPPER"
+        rm -f "$WRAPPER"
+        test -s {output.trace}
+        """
+
+
+rule ingest_mmio:
+    """Parse a Renode execution trace into MMIO events JSONL, then load to Parquet."""
+    input:
+        trace = "build/{target}/traces/{scenario}.trace",
+    output:
+        parquet = "build/{target}/tables/mmio_events_{scenario}.parquet",
+    params:
+        jsonl = "build/{target}/mmio_events_{scenario}.jsonl",
+    shell:
+        r"""
+        {PYTHON} scripts/renode/parse_trace.py \
+            --trace {input.trace} \
+            --scenario {wildcards.scenario} \
+            --output {params.jsonl}
+        {PYTHON} scripts/ingest/load_table.py \
+            --table mmio_events \
+            --source {wildcards.target} \
+            --output {output.parquet} \
+            {params.jsonl}
+        rm -f {params.jsonl}
+        """
+
+
+rule datalog_export:
+    """Export base facts from the warehouse for Souffle consumption.
+
+    Produces tab-separated .facts files (no header) matching the .input
+    declarations in reachability.dl.
+    """
+    input:
+        calls = "build/{target}/tables/calls.parquet",
+        functions = "build/{target}/tables/functions.parquet",
+    output:
+        calls_facts = "build/{target}/datalog/calls.facts",
+        functions_facts = "build/{target}/datalog/functions.facts",
+    shell:
+        r"""
+        {PYTHON} scripts/datalog/export_facts.py {wildcards.target}
+        test -f {output.calls_facts}
+        test -f {output.functions_facts}
+        """
+
+
+rule datalog_derive:
+    """Run Souffle reachability rules over exported facts.
+
+    Derives transitive call reachability, orchestrator detection,
+    unreachable-from-main analysis, and subsystem clustering. All
+    outputs are tab-separated CSV files in the target's datalog dir.
+    """
+    input:
+        calls_facts = "build/{target}/datalog/calls.facts",
+        functions_facts = "build/{target}/datalog/functions.facts",
+        rules = "scripts/datalog/reachability.dl",
+    output:
+        reaches = "build/{target}/datalog/reaches.csv",
+        reach_count = "build/{target}/datalog/reach_count.csv",
+        orchestrators = "build/{target}/datalog/orchestrators.csv",
+        unreachable = "build/{target}/datalog/unreachable_from_main.csv",
+        subsystem_pairs = "build/{target}/datalog/subsystem_pairs.csv",
+    shell:
+        r"""
+        cd build/{wildcards.target}/datalog && \
+        {SOUFFLE} {REPO_ROOT}/scripts/datalog/reachability.dl
         """
 
 

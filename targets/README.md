@@ -129,6 +129,49 @@ Both entries are already in `config.yaml`. After copying the ELFs,
   D18) and is useful signal if you want to expand the target matrix
   intentionally.
 
+## Building Pico + FreeRTOS targets
+
+The FreeRTOS targets use `pico-examples` with FreeRTOS-Kernel.
+
+### Prerequisites
+
+```bash
+# Clone FreeRTOS-Kernel (outside ripcord)
+git clone --depth 1 https://github.com/FreeRTOS/FreeRTOS-Kernel ~/FreeRTOS-Kernel
+```
+
+### Build
+
+```bash
+export PICO_SDK_PATH=~/pico-sdk
+export FREERTOS_KERNEL_PATH=~/FreeRTOS-Kernel
+cd ~/pico-examples/build
+
+# Reconfigure with FreeRTOS support
+cmake -G Ninja -DFREERTOS_KERNEL_PATH=$FREERTOS_KERNEL_PATH ..
+
+# hello_freertos (heap4 variant)
+ninja freertos/hello_freertos/hello_freertos
+mkdir -p ~/Desktop/ripcord/targets/pico_freertos_hello
+cp freertos/hello_freertos/hello_freertos.elf \
+   ~/Desktop/ripcord/targets/pico_freertos_hello/
+
+# static allocation variant
+ninja freertos/hello_freertos/hello_freertos_static
+mkdir -p ~/Desktop/ripcord/targets/pico_freertos_static
+cp freertos/hello_freertos/hello_freertos_static.elf \
+   ~/Desktop/ripcord/targets/pico_freertos_static/
+
+# Stripped blind-recovery test target
+mkdir -p ~/Desktop/ripcord/targets/pico_freertos_hello_stripped
+arm-none-eabi-strip -s \
+   ~/Desktop/ripcord/targets/pico_freertos_hello/hello_freertos.elf \
+   -o ~/Desktop/ripcord/targets/pico_freertos_hello_stripped/hello_freertos_stripped.elf
+```
+
+All entries are already in `config.yaml`. After copying the ELFs,
+`snakemake --cores 4 --resources ghidra=1` picks them up.
+
 ## Adding more targets
 
 Build an ELF somewhere, drop it under `targets/<your_target_name>/`,
@@ -149,37 +192,33 @@ target in the config. `arch` selects which `nm` binary the
 
 ## Target candidates for the early roadmap
 
-Updated 2026-04-05 based on what's been built and what's most useful
+Updated 2026-04-08 based on what's been built and what's most useful
 next.
 
 **Done:**
 
-1. ✅ **Raspberry Pi Pico blinky** (Cortex-M0+, newlib, -O3)
-2. ✅ **Zephyr hello_world on qemu_cortex_m3** (Cortex-M3, picolibc, -Os)
-3. ✅ **Zephyr synchronization on qemu_cortex_m3** (same build tuple as #2)
+1. ✅ **Raspberry Pi Pico blinky** (Cortex-M0+, newlib, -O3) — 84 fn
+2. ✅ **Zephyr hello_world on qemu_cortex_m3** (Cortex-M3, picolibc, -Os) — 110 fn
+3. ✅ **Zephyr synchronization on qemu_cortex_m3** (same build tuple as #2) — 130 fn
+4. ✅ **Pico + FreeRTOS hello (heap4)** (Cortex-M0+, newlib, -O3) — 265 fn
+5. ✅ **Pico + FreeRTOS hello (static alloc)** (same build tuple as #4) — 284 fn
+6. ✅ **Pico hello_usb** (Cortex-M0+, newlib, -O3, + TinyUSB) — 237 fn
+7. ✅ **Pico hello_timer** (Cortex-M0+, newlib, -O3) — 155 fn
+8. ✅ **Pico + FreeRTOS hello (stripped)** (same binary as #4, symbols removed) — 197 fn. Blind recovery test target: 86.6% recall, 94.9% precision when matched against the full-symbol corpus.
 
 **Recommended next, in rough cost-value order:**
 
-4. **FreeRTOS compiled for `cortex-m0plus -O3` with newlib** as a
-   *reference corpus entry*, not a test target — matches the Pico
-   build tuple so structural fingerprinting can identify FreeRTOS
-   functions against a future Pico-FreeRTOS binary. Half a day of
-   build infrastructure work; see design-decision D18 for the
-   rationale.
-5. **Pico with FreeRTOS** (test target). Same toolchain as Pico
-   blinky, different linked library surface. Once #4 exists, the
-   structural signature query should light up the FreeRTOS library
-   functions in this binary automatically.
-6. **Second Pico SDK example** (hello_usb or hello_timer). Same
-   build tuple as Pico blinky, different application code — tests
-   whether the structural match works inside the Pico ecosystem
-   the same way it did inside the Zephyr pair.
-7. **STM32 CubeMX blinky.** New build tuple (Cortex-M4, vendor HAL);
-   expands the matrix. Exposes ST HAL for eventual vendor library
-   identification.
-8. **Arduino Uno blink.** AVR 8-bit, cross-architecture generality
-   stress test. Validates that the pipeline handles non-ARM ISAs.
-9. **ESP32-C3 blinky.** RISC-V, more architecture diversity.
+9. **FreeRTOS for `cortex-m3 -Os` with picolibc.** Matches the
+   Zephyr build config for cross-ecosystem library-ID testing. This
+   is the highest-value next target because it tests whether FreeRTOS
+   functions can be identified across the Pico/Zephyr divide when
+   compiled with matching flags.
+10. **STM32 CubeMX blinky.** New build tuple (Cortex-M4, vendor HAL);
+    expands the matrix. Exposes ST HAL for eventual vendor library
+    identification.
+11. **Arduino Uno blink.** AVR 8-bit, cross-architecture generality
+    stress test. Validates that the pipeline handles non-ARM ISAs.
+12. **ESP32-C3 blinky.** RISC-V, more architecture diversity.
 
 Any combination is fine — the pipeline doesn't care what the targets
 are, it just runs Ghidra on each ELF and populates the warehouse.

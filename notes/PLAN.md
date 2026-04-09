@@ -4,24 +4,37 @@ Broad, phased, intentionally preserving every thread from the design
 discussion. Steps within a phase are roughly sequential; phases overlap in
 practice.
 
-## Status snapshot (2026-04-05)
+## Status snapshot (2026-04-08)
 
-**Phase 0:** ✅ complete. Three targets in warehouse (`pico_blinky`,
-`zephyr_hello_world`, `zephyr_synchronization`), all five Stage 0
-tables populated (`functions`, `calls`, `basic_blocks`, `xrefs`,
-`strings`) plus `ground_truth_functions` regression signal. See
-`CLAUDE.md` "Current state" for the live numbers.
+**Phase 0:** ✅ complete. Eight targets in warehouse (5 Pico + 2
+Zephyr + 1 stripped blind-recovery target), up to eight table types
+per target (`functions` with `body_hash`, `calls`, `basic_blocks`,
+`xrefs`, `strings`, `pcode_features`, `mmio_events`,
+`ground_truth_functions`). See `CLAUDE.md` for the live numbers.
 
-**Phase 1:** partially validated. The rule-based structural
-fingerprinting primitive works at ~96% cluster-level precision on
-two Zephyr targets with matching build configs; fails cleanly on
-Pico↔Zephyr where build configs mismatch. See
-`notes/fingerprinting-baseline.md`. Reference corpus build and
-the remaining Phase 1 steps (MMIO ranges, Renode traces, register
-map) have not started.
+**Phase 1:** library-ID validated end-to-end including blind
+recovery. Structural fingerprinting identifies 173 cross-target
+matches between two Pico-FreeRTOS targets (105 FreeRTOS-specific).
+Blind recovery on stripped binary: 86.6% recall, 94.9% precision.
+P-Code extraction working on all 8 targets; exact hash matching
+works within-ISA (93-94% precision at ops >= 50), fails cross-ISA.
+Confidence scoring scheme designed (`notes/confidence-scheme.md`).
 
-**Phases 2+:** not started. Deferred until Phase 1 library ID is
-working against a homogeneous reference corpus.
+**Phase 1 §1.3 (Renode):** proven standalone. Renode boots
+`zephyr_hello_world` on custom LM3S6965 platform; 394 MMIO events
+from 2s boot captured in `mmio_events` table. Not yet wired into
+Snakemake. See `notes/renode-setup.md`.
+
+**Phase 2 §2.1 (Datalog):** proven standalone. Souffle reachability
+derivation on `pico_freertos_hello`: 80/265 functions reachable
+from `main`, 20 orchestrators identified, subsystem clusters
+extracted. DuckDB recursive CTE equivalent in
+`notes/queries/reachability.sql`. Not yet wired into Snakemake.
+See `notes/datalog-baseline.md`.
+
+**Phases 2.2+, 3+:** not started. Deferred until Snakemake
+integration of Renode and Datalog, and cross-ISA histogram
+similarity is tested.
 
 ## Phase 0 — Bootstrapping (days, not weeks) ✅ COMPLETE
 
@@ -201,20 +214,35 @@ any LLM budget.
 - Produce a coverage report per target: "X% of bytes identified as
   library code, with Y distinct libraries recognized."
 
-**Partial implementation (2026-04-05):** the structural-feature
-half of this step is implemented as `notes/queries/structural_signatures.sql`
-and validated end-to-end against two Zephyr targets. Feature
-vector is `(size, basic_block_count, instruction_count,
-outgoing_calls, distinct_callees, reads, writes, jumps)` aggregated
-from the five Stage 0 tables. Strict 8-tuple match hits 96% cluster-
-level precision on same-build target pairs. The baseline has three
-known limitations: it fails on cross-build-config target pairs
-(different ISA, -O, libc), it has within-target structural twins
-(~3 in 75 clusters on Zephyr), and it doesn't produce a
-`functions.inferred_name` column yet (it reports matches at the
-cluster level, not by writing back to the warehouse). All three
-are known next steps — see `notes/fingerprinting-baseline.md` for
-the concrete fix list.
+**Implementation status (2026-04-08):** Structural + byte-hash
+matching fully validated. `notes/queries/structural_signatures.sql`
+implements the feature vector `(size, basic_block_count,
+instruction_count, outgoing_calls, distinct_callees, reads, writes,
+jumps)` with name-aware precision analysis and byte-hash
+disambiguation. 96% cluster-level precision on same-build pairs;
+100% with body_hash.
+
+Cross-target library-ID demonstrated: 173 structural matches
+between two Pico-FreeRTOS targets (105 FreeRTOS-specific).
+
+**Blind recovery validated:** `pico_freertos_hello_stripped` (all
+symbols removed) matched against the full-symbol corpus. Result:
+86.6% recall (171/197 functions identified), 94.9% precision
+(162/171 correct). The 9 false positives are structural twins —
+the expected failure mode for rule-based matching alone.
+
+**P-Code features extracted** for all 8 targets (`pcode_features`
+table). Exact `pcode_sequence_hash` matching works within-ISA
+(93-94% precision at ops >= 50 within Pico M0+ targets) but
+produces zero true positives cross-ISA (M0+ vs M3). The opcode
+histogram column is already in the table; cosine similarity over
+histograms is the next test for cross-ISA matching. See
+`notes/queries/cross_isa_pcode.sql`.
+
+**Remaining for §1.2:** fingerprint write-back (populating
+`functions.inferred_name` / `inferred_library` / `confidence` /
+`evidence_method` per `notes/confidence-scheme.md`), and P-Code
+histogram cosine similarity for cross-ISA matching.
 
 ### 1.3 Renode platform and trace capture
 
@@ -409,28 +437,31 @@ These are unresolved and will block later phases if left unanswered.
 
 **Still open:**
 
-1. **Renode platform baselines per target.** Most Cortex-M targets
-   have upstream `.repl` files in the Renode repo; pick and document
-   the baseline for each test target as it is added. `qemu_cortex_m3`
-   in particular emulates TI LM3S6965 — Renode has this board.
+1. **Renode platform baselines per target.** Partially resolved
+   2026-04-08. A custom `lm3s6965.repl` platform file was written
+   for the `qemu_cortex_m3` targets (Cortex-M3, UART0/1/2, NVIC).
+   Boots `zephyr_hello_world` successfully with 394 MMIO events
+   from 2s trace. GPIO and SysCtl peripherals are unmapped stubs
+   (produce warnings but don't block execution). See
+   `notes/renode-setup.md`. Remaining: platform files for RP2040
+   (Pico targets) and any future STM32/nRF boards.
 2. **How to scope scenarios.** A "scenario" is a unit of observable
    behavior. For blinky it's trivial ("boot, watch the LED GPIO for
    2s"). For richer targets, scope is an open question. Iterate.
-3. **Confidence scoring scheme.** 0-1 float? Categorical (low/med/high)?
-   The evidence log's usefulness depends on this being consistent.
-   This is **blocking** the first table that gains a `confidence`
-   column — the structural fingerprinting write-back will be the
-   first such table if we implement it that way. Write
-   `notes/confidence-scheme.md` before that happens. Estimated
-   cost: half an afternoon.
-4. **Reference corpus build matrix.** Given the finding that
-   matching build configs matter, the corpus needs to span
-   {ISA} × {-O level} × {libc} × {library}. How many points on
-   each axis for v1? Rough target: start with one library
-   (FreeRTOS) × one ISA (cortex-m0plus) × one -O (-O3) × one libc
-   (newlib), matching the Pico build config, and grow from there.
-   Build infrastructure should be designed from day 1 to make
-   adding points to the matrix trivial.
+3. ~~**Confidence scoring scheme.**~~ Resolved 2026-04-08. 0.0–1.0
+   float with named thresholds, `evidence_method` companion column,
+   composition via max, conflict detection. See
+   `notes/confidence-scheme.md`.
+4. **Reference corpus build matrix.** Further expanded 2026-04-08.
+   FreeRTOS × cortex-m0plus × -O3 × newlib: two variants (heap4,
+   static alloc) plus a stripped blind-recovery test. Pico SDK
+   examples: `hello_usb` (TinyUSB), `hello_timer`. Total: 8 targets
+   spanning two ISAs and two build ecosystems. Build infrastructure
+   proven (clone FreeRTOS-Kernel at `~/FreeRTOS-Kernel`, build via
+   pico-examples with `FREERTOS_KERNEL_PATH`, copy ELF, add to
+   config.yaml, run pipeline). Each new matrix point is ~30 minutes.
+   Next axis: FreeRTOS × cortex-m3 × -Os × picolibc (matching
+   Zephyr build config for cross-ecosystem library-ID).
 5. **Which LLM(s) to use, and what API budget per iteration.** This
    drives Phase 3 cost directly and needs a rough sanity check before
    the swarm goes live. Not urgent — Phase 3 is far off.
@@ -465,46 +496,72 @@ Things that are tempting but should wait:
   should live in a `platform_quirks` table and in comments in the
   Renode `.repl` file. Losing them is expensive.
 
-## Highest-leverage single action right now (updated 2026-04-05)
+## Highest-leverage single action right now (updated 2026-04-08)
 
-Phase 0 is done and Phase 1 has a working structural primitive. The
-next single action is **close the 3-of-75 within-target collision
-gap in the structural signature query**, then **start the Phase 1
-reference corpus with FreeRTOS built for `cortex-m0plus -O3` to
-match Pico's build config**, then **add a Pico-FreeRTOS target**
-to exercise the corpus against an unknown(ish) binary.
+**P-Code histogram cosine similarity for cross-ISA matching.** The
+`pcode_features` table already contains opcode histograms for all 8
+targets. Exact sequence hashes fail cross-ISA but work within-ISA.
+The histogram captures opcode distribution without order/register
+dependence — computing cosine similarity between Pico (M0+) and
+Zephyr (M3) histograms is the cheapest test of whether P-Code
+features can bridge the ISA gap. This is a single SQL query or
+short Python script, ~30 minutes of work.
 
-That sequence produces the project's first end-to-end library-ID
-result against an unknown target: a concrete "here are the FreeRTOS
-functions in this binary" answer with ~96%+ precision, using only
-SQL and the existing pipeline.
+After that, three parallel threads:
 
-Two concrete smaller fixes that unblock the above and are worth
-knocking out along the way:
+- **Snakemake integration for Renode + Datalog.** Both tools work
+  standalone (see `notes/renode-setup.md` and
+  `notes/datalog-baseline.md`). Wiring them into the Snakefile
+  makes them reproducible and cacheable. Renode needs a `.resc`
+  per (target, scenario); Datalog needs `calls` + `functions`.
 
-- **Name-aware post-processing** in `structural_signatures.sql`.
-  Pure SQL change, ~10 minutes, takes the cluster-level precision
-  from 96% to ~100% on named pairs by splitting clusters with
-  multiple distinct names.
+- **Computed call target recovery.** The Datalog baseline shows 70%
+  of functions are unreachable from `main` — almost all ISR
+  handlers and FreeRTOS tasks passed as function pointers to
+  `xTaskCreate`. Recovering these edges (from xrefs, constant
+  propagation, or Renode traces) would dramatically improve
+  call-graph completeness.
 
-- **Byte-pattern hash column** in the `functions` table. A small
-  extractor addition (read function bytes, normalize relocations,
-  SHA-1) that gives every function a stable discriminator beyond
-  the current feature vector. Closes the within-target structural
-  twins gap for real.
+- **Agent task schema design (Phase 3 prep).** The warehouse is
+  rich enough to support agent work. Designing the task schema is
+  the prerequisite for the Phase 3 worker loop.
 
-The original Phase 0 headline — "build Pico blinky and get the
-pipeline running end-to-end" — was the 2026-04-04 snapshot and is
-preserved below for history. It's done.
+**Done in previous sessions (preserved for history):**
+
+- ~~P-Code cross-ISA test~~ (2026-04-08). Exact hash fails cross-ISA,
+  works within-ISA at 93-94%. Histogram similarity is the path.
+- ~~Blind recovery experiment~~ (2026-04-08). Stripped binary: 86.6%
+  recall, 94.9% precision. First end-to-end blind ID demo.
+- ~~Renode trace capture~~ (2026-04-08). 394 MMIO events from 2s
+  `zephyr_hello_world` boot. Custom LM3S6965 platform file.
+- ~~Datalog derivation layer~~ (2026-04-08). Souffle reachability on
+  `pico_freertos_hello`: 80/265 reachable, 20 orchestrators.
+- ~~P-Code feature extraction~~ (2026-04-08). `export_pcode.py` +
+  `pcode_features` table for all 8 targets.
+- ~~Close the 3-of-75 collision gap~~ (2026-04-08). Name-aware
+  precision query and byte-hash matching. All collisions resolved.
+- ~~Build FreeRTOS reference corpus~~ (2026-04-08). Two
+  Pico-FreeRTOS variants built and ingested. 173 cross-target
+  matches, 105 FreeRTOS-specific.
+- ~~Add Pico SDK examples~~ (2026-04-08). `hello_usb` (237 fn)
+  and `hello_timer` (155 fn) added.
+- ~~Write confidence-scheme.md~~ (2026-04-08). Done.
+- ~~Fix parallel Ghidra extraction~~ (2026-04-08). Snakemake
+  `resources: ghidra=1` constraint added.
 
 ---
 
-*Previous 2026-04-04 snapshot:* "If only one thing gets done this
-week: build the Pico SDK blinky target and get the Phase 0
-pipeline running against it end-to-end. That is the milestone
-where ripcord stops being a design document and starts being a
-working tool. Every subsequent target, every subsequent pipeline
-capability, is incremental from there."
+*Previous 2026-04-08 (early) snapshot:* "Write the fingerprint
+write-back, cross-ecosystem matching, export_pcode.py." P-Code
+extraction done; write-back deferred in favor of blind recovery
+experiment and cross-ISA empirical testing.
+
+*Previous 2026-04-05 snapshot:* "Close the 3-of-75 collision gap,
+start the reference corpus with FreeRTOS, add a Pico-FreeRTOS
+target." All done.
+
+*Previous 2026-04-04 snapshot:* "Build the Pico SDK blinky target
+and get the Phase 0 pipeline running end-to-end." Done.
 
 ## Where learned fingerprinting fits into the roadmap
 

@@ -1,0 +1,884 @@
+#!/usr/bin/env -S uv run python
+"""Interactive firmware analysis assistant.
+
+Combines ripcord's warehouse (DuckDB over Parquet), decompiled code,
+and LLM analysis into a conversational interface for firmware RE.
+
+Usage:
+    scripts/analyze --target stock_v120
+    scripts/analyze --target stock_v120 "what writes to USART2_DR?"
+    scripts/analyze --target stock_v120 --model claude-sonnet-4-20250514 "trace the scope init"
+    scripts/analyze --target stock_v120 --dry-run "what functions touch SPI3?"
+"""
+
+from __future__ import annotations
+
+import argparse
+import glob
+import json
+import os
+import re
+import sys
+import time
+from collections import defaultdict
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+
+# ---------------------------------------------------------------------------
+# Peripheral register map (AT32F403A / STM32F103-compatible)
+# ---------------------------------------------------------------------------
+
+PERIPHERAL_RANGES: list[tuple[int, int, str]] = [
+    # APB1
+    (0x40000000, 0x400003FF, "TMR2"),
+    (0x40000400, 0x400007FF, "TMR3"),
+    (0x40000800, 0x40000BFF, "TMR4"),
+    (0x40000C00, 0x40000FFF, "TMR5"),
+    (0x40001800, 0x40001BFF, "TMR6"),
+    (0x40001C00, 0x40001FFF, "TMR7"),
+    (0x40003000, 0x400033FF, "USART6/7/8"),
+    (0x40003800, 0x40003BFF, "SPI2"),
+    (0x40003C00, 0x40003FFF, "SPI3"),
+    (0x40004400, 0x400047FF, "USART2"),
+    (0x40004800, 0x40004BFF, "USART3"),
+    (0x40004C00, 0x40004FFF, "UART4"),
+    (0x40005400, 0x400057FF, "I2C1"),
+    (0x40005800, 0x40005BFF, "I2C2"),
+    (0x40005C00, 0x40005FFF, "I2C3"),
+    (0x40007000, 0x400073FF, "DAC"),
+    (0x40007400, 0x400077FF, "PWR"),
+    # APB2
+    (0x40010000, 0x400103FF, "AFIO/IOMUX"),
+    (0x40010400, 0x400107FF, "EXTI"),
+    (0x40010800, 0x40010BFF, "GPIOA"),
+    (0x40010C00, 0x40010FFF, "GPIOB"),
+    (0x40011000, 0x400113FF, "GPIOC"),
+    (0x40011400, 0x400117FF, "GPIOD"),
+    (0x40011800, 0x40011BFF, "GPIOE"),
+    (0x40012400, 0x400127FF, "ADC1"),
+    (0x40012800, 0x40012BFF, "ADC2"),
+    (0x40013400, 0x400137FF, "TMR1"),
+    (0x40013800, 0x40013BFF, "SPI1"),
+    (0x40013C00, 0x40013FFF, "TMR8"),
+    (0x40014000, 0x400143FF, "USART1"),
+    (0x40014C00, 0x40014FFF, "TMR9"),
+    (0x40015000, 0x400153FF, "TMR10"),
+    (0x40015400, 0x400157FF, "TMR11"),
+    # AHB
+    (0x40020000, 0x400203FF, "DMA1"),
+    (0x40020400, 0x400207FF, "DMA2"),
+    (0x40021000, 0x400210FF, "RCC"),
+    (0x40022000, 0x400220FF, "FLASH_CTRL"),
+    # SDIO
+    (0xA0000000, 0xA00003FF, "SDIO"),
+    # FSMC / LCD
+    (0x60000000, 0x6FFFFFFF, "FSMC/LCD"),
+    # Cortex-M4 system
+    (0xE000E010, 0xE000E01F, "SYSTICK"),
+    (0xE000E100, 0xE000ECFF, "NVIC"),
+    (0xE000ED00, 0xE000EDFF, "SCB"),
+    (0xE000EF00, 0xE000EFFF, "FPU"),
+]
+
+PERIPHERAL_NAME_TO_RANGES: dict[str, tuple[int, int]] = {}
+for _lo, _hi, _name in PERIPHERAL_RANGES:
+    PERIPHERAL_NAME_TO_RANGES[_name] = (_lo, _hi)
+
+
+def peripheral_name(addr: int) -> str:
+    """Map an address to a peripheral name, or hex fallback."""
+    for lo, hi, name in PERIPHERAL_RANGES:
+        if lo <= addr <= hi:
+            return name
+    return f"UNKNOWN_0x{addr:08X}"
+
+
+def find_peripheral_range(name_fragment: str) -> list[tuple[int, int, str]]:
+    """Find peripheral ranges matching a name fragment (case-insensitive)."""
+    frag = name_fragment.upper()
+    return [(lo, hi, n) for lo, hi, n in PERIPHERAL_RANGES if frag in n.upper()]
+
+
+# ---------------------------------------------------------------------------
+# Warehouse
+# ---------------------------------------------------------------------------
+
+
+def discover_tables(build_dir: str, target: str | None = None) -> dict[str, list[str]]:
+    """Discover parquet tables. If target given, only that target."""
+    groups: defaultdict[str, list[str]] = defaultdict(list)
+    if target:
+        pattern = str(REPO_ROOT / build_dir / target / "tables" / "*.parquet")
+    else:
+        pattern = str(REPO_ROOT / build_dir / "*" / "tables" / "*.parquet")
+    for path in glob.glob(pattern):
+        name = os.path.splitext(os.path.basename(path))[0]
+        groups[name].append(path)
+    return {k: sorted(v) for k, v in sorted(groups.items())}
+
+
+def register_views(conn, tables: dict[str, list[str]]) -> None:
+    """Register parquet files as DuckDB views."""
+    for name, paths in tables.items():
+        paths_sql = ", ".join(f"'{p}'" for p in paths)
+        conn.execute(
+            f"CREATE OR REPLACE VIEW {name} AS "
+            f"SELECT * FROM read_parquet([{paths_sql}], union_by_name=true);"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Provenance instructions (from context.py)
+# ---------------------------------------------------------------------------
+
+PROVENANCE_INSTRUCTIONS = """\
+For EVERY claim you make, tag it with exactly one provenance level:
+
+- [hardware-confirmed] -- verified on physical hardware
+- [direct-xref] -- observed directly in the warehouse xref/call/string table
+- [decompile-derived] -- read from Ghidra decompiled pseudo-C
+- [synthesized-model] -- combined from multiple evidence sources
+- [hypothesis] -- plausible inference, not directly observed
+
+Rules:
+- Never present a [synthesized-model] as [direct-xref]
+- Never present a [hypothesis] as [decompile-derived]
+- When uncertain, say so explicitly
+- Suggest follow-up queries the analyst could run"""
+
+
+# ---------------------------------------------------------------------------
+# Analyzer
+# ---------------------------------------------------------------------------
+
+
+class FirmwareAnalyzer:
+    def __init__(
+        self,
+        target: str,
+        build_dir: str = "build",
+        model: str = "claude-sonnet-4-20250514",
+        dry_run: bool = False,
+    ):
+        import duckdb
+
+        self.target = target
+        self.model = model
+        self.dry_run = dry_run
+        self.conn = duckdb.connect(":memory:")
+        self.conversation: list[dict] = []
+
+        # Register warehouse -- target-specific tables + all targets for cross-ref
+        target_tables = discover_tables(build_dir, target)
+        if not target_tables:
+            print(
+                f"error: no parquet tables found for target '{target}' "
+                f"under {build_dir}/{target}/tables/",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        # Register target-specific views
+        register_views(self.conn, target_tables)
+
+        # Also register all-target views with _all suffix for cross-target queries
+        all_tables = discover_tables(build_dir)
+        for name, paths in all_tables.items():
+            paths_sql = ", ".join(f"'{p}'" for p in paths)
+            self.conn.execute(
+                f"CREATE OR REPLACE VIEW {name}_all AS "
+                f"SELECT * FROM read_parquet([{paths_sql}], union_by_name=true);"
+            )
+
+        self.available_tables = sorted(target_tables.keys())
+        self.target_summary = self._get_target_summary()
+
+        # Init Anthropic client (lazy, only if not dry_run)
+        self.client = None
+        if not dry_run:
+            self._init_client()
+
+    def _init_client(self):
+        """Initialize Anthropic client, loading .env if needed."""
+        # Try loading .env
+        env_path = REPO_ROOT / ".env"
+        if env_path.exists() and "ANTHROPIC_API_KEY" not in os.environ:
+            with open(env_path) as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith("#") and "=" in line:
+                        key, _, val = line.partition("=")
+                        os.environ[key.strip()] = val.strip()
+
+        try:
+            import anthropic
+
+            self.client = anthropic.Anthropic()
+        except Exception as exc:
+            print(
+                f"warning: could not init Anthropic client: {exc}\n"
+                "  Falling back to --dry-run mode.",
+                file=sys.stderr,
+            )
+            self.dry_run = True
+
+    def _get_target_summary(self) -> str:
+        """Compact summary of the target for system context."""
+        parts = []
+        counts = {}
+        for table in self.available_tables:
+            try:
+                row = self.conn.execute(
+                    f"SELECT COUNT(*) FROM {table} WHERE source = ?",
+                    [self.target],
+                ).fetchone()
+                counts[table] = row[0] if row else 0
+            except Exception:
+                try:
+                    row = self.conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()
+                    counts[table] = row[0] if row else 0
+                except Exception:
+                    pass
+
+        for table, n in counts.items():
+            parts.append(f"{n} {table}")
+        return ", ".join(parts) if parts else "(no data)"
+
+    def _build_system_prompt(self) -> str:
+        """Build the system prompt with target context."""
+        return f"""\
+You are a firmware reverse engineering assistant analyzing target '{self.target}'.
+
+## Target Summary
+{self.target_summary}
+
+## Evidence Discipline
+{PROVENANCE_INSTRUCTIONS}
+
+## Available Data
+The following warehouse tables are loaded for this target:
+{', '.join(self.available_tables)}
+
+Cross-target views are available with _all suffix (e.g. functions_all).
+
+## Peripheral Map
+This is an AT32F403A (Cortex-M4, STM32F103-compatible). Key peripherals:
+USART1 @ 0x40014000, USART2 @ 0x40004400, USART3 @ 0x40004800,
+SPI1 @ 0x40013800, SPI2 @ 0x40003800, SPI3 @ 0x40003C00,
+DMA1 @ 0x40020000, DMA2 @ 0x40020400,
+GPIOA-E @ 0x40010800-0x40011BFF,
+TMR1 @ 0x40013400, TMR2 @ 0x40000000, TMR3 @ 0x40000400,
+RCC @ 0x40021000, FLASH @ 0x40022000, FSMC/LCD @ 0x60000000,
+ADC1 @ 0x40012400, ADC2 @ 0x40012800, SDIO @ 0xA0000000.
+
+When answering:
+1. Ground claims in specific warehouse data (function addresses, xref counts, decompiled code)
+2. Tag every claim with provenance level
+3. When you're uncertain, say so explicitly
+4. Suggest follow-up queries the analyst could run"""
+
+    # -------------------------------------------------------------------
+    # Context gathering
+    # -------------------------------------------------------------------
+
+    def _gather_context(self, question: str) -> dict:
+        """Run warehouse queries relevant to the question."""
+        context: dict[str, str] = {}
+        context["summary"] = self.target_summary
+        q = question.lower()
+
+        # Peripheral register questions
+        periph_keywords = [
+            "usart", "spi", "uart", "dma", "gpio", "timer", "tmr",
+            "peripheral", "register", "mmio", "adc", "dac", "i2c",
+            "rcc", "flash", "nvic", "systick", "sdio", "fsmc", "lcd",
+            "exti", "pwr",
+        ]
+        if any(w in q for w in periph_keywords):
+            context["peripheral_accesses"] = self._query_peripheral_accesses(question)
+
+        # Function-specific questions
+        if any(w in q for w in ["function", "fun_", "0x080", "calls", "callers", "callees", "entry"]):
+            context["function_info"] = self._query_function_info(question)
+
+        # String references
+        if any(w in q for w in ["string", "text", "message", "error", "print", "log"]):
+            context["strings"] = self._query_strings()
+
+        # Decompiled code
+        if any(w in q for w in ["decompile", "code", "implementation", "how does", "what does", "trace", "source", "write", "read", "init", "setup"]):
+            context["decompiled"] = self._query_decompiled(question)
+
+        # Call graph
+        if any(w in q for w in ["call", "reach", "path", "tree", "who calls", "what calls", "caller", "callee"]):
+            context["call_graph"] = self._query_call_graph(question)
+
+        # Cross-version
+        if any(w in q for w in ["version", "changed", "diff", "evolution", "v103", "v107", "v112", "v120", "compare"]):
+            context["version_info"] = self._query_version_diff(question)
+
+        # State / RAM structure
+        if any(w in q for w in ["state", "global", "dat_2000", "0x2000", "ram", "offset", "struct"]):
+            context["state_accesses"] = self._query_state_accesses(question)
+
+        # If nothing matched, at least provide broad overview
+        if len(context) == 1:  # only summary
+            context["overview"] = self._query_overview()
+
+        return context
+
+    def _query_peripheral_accesses(self, question: str) -> str:
+        """Find functions that access peripherals mentioned in the question."""
+        q = question.upper()
+
+        # Extract peripheral names from question
+        matched_peripherals = []
+        for lo, hi, name in PERIPHERAL_RANGES:
+            if name.upper() in q or any(
+                part in q for part in name.upper().split("/")
+            ):
+                matched_peripherals.append((lo, hi, name))
+
+        if not matched_peripherals:
+            # Broad peripheral access summary
+            rows = self.conn.execute("""
+                SELECT x.to_addr, x.ref_type, f.name, f.addr,
+                       COUNT(*) as n
+                FROM xrefs x
+                JOIN functions f ON f.source = x.source AND f.addr = x.function_addr
+                WHERE x.source = ?
+                  AND x.to_addr >= 1073741824
+                GROUP BY x.to_addr, x.ref_type, f.name, f.addr
+                ORDER BY n DESC
+                LIMIT 30
+            """, [self.target]).fetchall()
+
+            if not rows:
+                return "No peripheral accesses found in xrefs."
+
+            lines = ["Peripheral accesses (top 30 by count):"]
+            for r in rows:
+                pname = peripheral_name(r[0])
+                lines.append(
+                    f"  {pname} 0x{r[0]:08X} {r[1]:6s} by {r[2]} (0x{r[3]:08X}) x{r[4]}"
+                )
+            return "\n".join(lines)
+
+        # Specific peripheral query
+        lines = []
+        for lo, hi, pname in matched_peripherals:
+            rows = self.conn.execute("""
+                SELECT x.to_addr, x.ref_type, f.name, f.addr,
+                       COUNT(*) as n
+                FROM xrefs x
+                JOIN functions f ON f.source = x.source AND f.addr = x.function_addr
+                WHERE x.source = ?
+                  AND x.to_addr >= ? AND x.to_addr <= ?
+                GROUP BY x.to_addr, x.ref_type, f.name, f.addr
+                ORDER BY x.to_addr, n DESC
+            """, [self.target, lo, hi]).fetchall()
+
+            lines.append(f"\n{pname} (0x{lo:08X}-0x{hi:08X}): {len(rows)} access groups")
+            for r in rows:
+                offset = r[0] - lo
+                lines.append(
+                    f"  +0x{offset:03X} (0x{r[0]:08X}) {r[1]:6s} by {r[2]} (0x{r[3]:08X}) x{r[4]}"
+                )
+
+        return "\n".join(lines)
+
+    def _query_function_info(self, question: str) -> str:
+        """Get function metadata for functions mentioned in the question."""
+        # Extract addresses from question
+        addrs = re.findall(r"0x[0-9a-fA-F]+", question)
+        # Extract FUN_ names
+        fun_names = re.findall(r"FUN_[0-9a-fA-F]+", question, re.IGNORECASE)
+
+        results = []
+
+        for addr_str in addrs:
+            try:
+                addr = int(addr_str, 16)
+            except ValueError:
+                continue
+            row = self.conn.execute("""
+                SELECT f.addr, f.name, f.size, f.basic_block_count,
+                       f.signature, f.body_hash
+                FROM functions f
+                WHERE f.source = ? AND f.addr = ?
+            """, [self.target, addr]).fetchone()
+            if row:
+                results.append(
+                    f"  0x{row[0]:08X} {row[1]} size={row[2]} bb={row[3]} "
+                    f"sig={row[4] or '?'} hash={row[5] or '?'}"
+                )
+
+        for name in fun_names:
+            rows = self.conn.execute("""
+                SELECT f.addr, f.name, f.size, f.basic_block_count
+                FROM functions f
+                WHERE f.source = ? AND f.name = ?
+            """, [self.target, name]).fetchall()
+            for row in rows:
+                results.append(
+                    f"  0x{row[0]:08X} {row[1]} size={row[2]} bb={row[3]}"
+                )
+
+        if not results:
+            return "No matching functions found for the addresses/names in the question."
+        return "Function info:\n" + "\n".join(results)
+
+    def _query_strings(self) -> str:
+        """Get all strings in the target."""
+        rows = self.conn.execute("""
+            SELECT addr, value, length
+            FROM strings
+            WHERE source = ?
+            ORDER BY addr
+            LIMIT 100
+        """, [self.target]).fetchall()
+
+        if not rows:
+            return "No strings found."
+        lines = [f"Strings ({len(rows)} shown):"]
+        for r in rows:
+            val = r[1][:80] + ("..." if len(r[1]) > 80 else "")
+            lines.append(f"  0x{r[0]:08X} [{r[2]:3d}] {val!r}")
+        return "\n".join(lines)
+
+    def _query_decompiled(self, question: str) -> str:
+        """Find and return decompiled code for relevant functions."""
+        results = []
+        budget = 15000  # chars total
+
+        # Check for specific addresses in question
+        addrs = re.findall(r"0x[0-9a-fA-F]+", question)
+        for addr_str in addrs:
+            if budget <= 0:
+                break
+            try:
+                addr = int(addr_str, 16)
+            except ValueError:
+                continue
+            row = self.conn.execute("""
+                SELECT name, decompiled_c FROM decompiled
+                WHERE source = ? AND addr = ? AND decompile_success = TRUE
+            """, [self.target, addr]).fetchone()
+            if row and row[1]:
+                code = row[1][:budget]
+                if len(row[1]) > budget:
+                    code += f"\n... [truncated, {len(row[1])} chars total]"
+                results.append(f"### {row[0]} @ 0x{addr:08X}\n```c\n{code}\n```")
+                budget -= len(code)
+
+        # Check for peripheral-related functions if question mentions peripherals
+        q = question.upper()
+        for lo, hi, pname in PERIPHERAL_RANGES:
+            if budget <= 0:
+                break
+            if pname.upper() not in q and not any(
+                part in q for part in pname.upper().split("/")
+            ):
+                continue
+            # Find functions that write to this peripheral
+            fn_rows = self.conn.execute("""
+                SELECT DISTINCT f.addr, f.name
+                FROM xrefs x
+                JOIN functions f ON f.source = x.source AND f.addr = x.function_addr
+                WHERE x.source = ?
+                  AND x.to_addr >= ? AND x.to_addr <= ?
+                  AND x.ref_type = 'WRITE'
+                ORDER BY f.addr
+                LIMIT 5
+            """, [self.target, lo, hi]).fetchall()
+
+            for fn_row in fn_rows:
+                if budget <= 0:
+                    break
+                dec_row = self.conn.execute("""
+                    SELECT decompiled_c FROM decompiled
+                    WHERE source = ? AND addr = ? AND decompile_success = TRUE
+                """, [self.target, fn_row[0]]).fetchone()
+                if dec_row and dec_row[0]:
+                    code = dec_row[0][:min(budget, 5000)]
+                    if len(dec_row[0]) > min(budget, 5000):
+                        code += f"\n... [truncated, {len(dec_row[0])} chars total]"
+                    results.append(
+                        f"### {fn_row[1]} @ 0x{fn_row[0]:08X} (writes to {pname})\n```c\n{code}\n```"
+                    )
+                    budget -= len(code)
+
+        if not results:
+            return ""
+        return "Decompiled code:\n\n" + "\n\n".join(results)
+
+    def _query_call_graph(self, question: str) -> str:
+        """Query call graph for functions mentioned in the question."""
+        addrs = re.findall(r"0x[0-9a-fA-F]+", question)
+        results = []
+
+        for addr_str in addrs:
+            try:
+                addr = int(addr_str, 16)
+            except ValueError:
+                continue
+
+            # Callers
+            caller_rows = self.conn.execute("""
+                SELECT DISTINCT f.addr, f.name
+                FROM calls c
+                JOIN functions f ON f.source = c.source AND f.addr = c.caller_addr
+                WHERE c.source = ? AND c.callee_addr = ?
+                ORDER BY f.addr
+            """, [self.target, addr]).fetchall()
+
+            # Callees
+            callee_rows = self.conn.execute("""
+                SELECT DISTINCT f.addr, f.name
+                FROM calls c
+                JOIN functions f ON f.source = c.source AND f.addr = c.callee_addr
+                WHERE c.source = ? AND c.caller_addr = ?
+                ORDER BY f.addr
+            """, [self.target, addr]).fetchall()
+
+            fn_name = self.conn.execute(
+                "SELECT name FROM functions WHERE source = ? AND addr = ?",
+                [self.target, addr],
+            ).fetchone()
+            name = fn_name[0] if fn_name else f"0x{addr:08X}"
+
+            lines = [f"\nCall graph for {name} (0x{addr:08X}):"]
+            if caller_rows:
+                lines.append(f"  Callers ({len(caller_rows)}):")
+                for r in caller_rows[:15]:
+                    lines.append(f"    <- {r[1]} (0x{r[0]:08X})")
+            if callee_rows:
+                lines.append(f"  Callees ({len(callee_rows)}):")
+                for r in callee_rows[:15]:
+                    lines.append(f"    -> {r[1]} (0x{r[0]:08X})")
+            results.append("\n".join(lines))
+
+        if not results:
+            # General: top fan-in / fan-out
+            fan_in = self.conn.execute("""
+                SELECT f.name, f.addr, COUNT(DISTINCT c.caller_addr) AS callers
+                FROM calls c
+                JOIN functions f ON f.source = c.source AND f.addr = c.callee_addr
+                WHERE c.source = ?
+                GROUP BY f.name, f.addr
+                ORDER BY callers DESC
+                LIMIT 10
+            """, [self.target]).fetchall()
+            lines = ["Top 10 most-called functions:"]
+            for r in fan_in:
+                lines.append(f"  {r[0]} (0x{r[1]:08X}) called by {r[2]} functions")
+            return "\n".join(lines)
+
+        return "\n".join(results)
+
+    def _query_version_diff(self, question: str) -> str:
+        """Compare function counts and body hashes across firmware versions."""
+        # Find all stock targets
+        version_rows = self.conn.execute("""
+            SELECT source, COUNT(*) as fn_count
+            FROM functions_all
+            WHERE source LIKE 'stock_%'
+            GROUP BY source
+            ORDER BY source
+        """).fetchall()
+
+        if not version_rows:
+            return "No cross-version data available."
+
+        lines = ["Firmware versions in warehouse:"]
+        for r in version_rows:
+            lines.append(f"  {r[0]}: {r[1]} functions")
+
+        # Body hash overlap between versions
+        if len(version_rows) >= 2:
+            sources = [r[0] for r in version_rows]
+            for i in range(len(sources)):
+                for j in range(i + 1, len(sources)):
+                    overlap = self.conn.execute("""
+                        SELECT COUNT(*) FROM (
+                            SELECT body_hash FROM functions_all
+                            WHERE source = ? AND body_hash IS NOT NULL
+                            INTERSECT
+                            SELECT body_hash FROM functions_all
+                            WHERE source = ? AND body_hash IS NOT NULL
+                        )
+                    """, [sources[i], sources[j]]).fetchone()
+                    lines.append(
+                        f"  {sources[i]} <-> {sources[j]}: "
+                        f"{overlap[0]} identical body hashes"
+                    )
+
+        return "\n".join(lines)
+
+    def _query_state_accesses(self, question: str) -> str:
+        """Query RAM/state structure accesses."""
+        # Find xrefs to SRAM range (0x20000000-0x2000FFFF)
+        rows = self.conn.execute("""
+            SELECT x.to_addr, x.ref_type, f.name, f.addr,
+                   COUNT(*) as n
+            FROM xrefs x
+            JOIN functions f ON f.source = x.source AND f.addr = x.function_addr
+            WHERE x.source = ?
+              AND x.to_addr >= 536870912 AND x.to_addr < 536936448
+            GROUP BY x.to_addr, x.ref_type, f.name, f.addr
+            ORDER BY x.to_addr, n DESC
+            LIMIT 50
+        """, [self.target]).fetchall()
+
+        if not rows:
+            return "No SRAM xrefs found."
+
+        lines = ["SRAM accesses (top 50 by address):"]
+        for r in rows:
+            lines.append(
+                f"  0x{r[0]:08X} {r[1]:6s} by {r[2]} (0x{r[3]:08X}) x{r[4]}"
+            )
+        return "\n".join(lines)
+
+    def _query_overview(self) -> str:
+        """Broad overview when no specific context matched."""
+        lines = [f"Target {self.target} overview:"]
+
+        # Largest functions
+        rows = self.conn.execute("""
+            SELECT name, addr, size, basic_block_count
+            FROM functions WHERE source = ?
+            ORDER BY size DESC LIMIT 10
+        """, [self.target]).fetchall()
+        lines.append("\nLargest functions:")
+        for r in rows:
+            lines.append(f"  {r[0]} (0x{r[1]:08X}) {r[2]} bytes, {r[3]} blocks")
+
+        # Peripheral summary
+        periph_rows = self.conn.execute("""
+            SELECT COUNT(*) FROM xrefs
+            WHERE source = ? AND to_addr >= 1073741824
+        """, [self.target]).fetchone()
+        lines.append(f"\nPeripheral xrefs: {periph_rows[0] if periph_rows else 0}")
+
+        return "\n".join(lines)
+
+    # -------------------------------------------------------------------
+    # LLM interaction
+    # -------------------------------------------------------------------
+
+    def _format_context(self, context: dict) -> str:
+        """Format gathered context into a string for the LLM."""
+        parts = []
+        for key, value in context.items():
+            if key == "summary":
+                continue  # already in system prompt
+            if value:
+                parts.append(f"## {key.replace('_', ' ').title()}\n{value}")
+        return "\n\n".join(parts)
+
+    def ask(self, question: str) -> str:
+        """Answer a question about the firmware."""
+        # Step 1: Gather context
+        context = self._gather_context(question)
+        context_text = self._format_context(context)
+
+        # Step 2: Build the user message
+        user_message = f"""\
+## Warehouse Context
+{context_text}
+
+## Question
+{question}"""
+
+        if self.dry_run:
+            return (
+                f"=== DRY RUN ===\n\n"
+                f"System prompt ({len(self._build_system_prompt())} chars):\n"
+                f"  [target: {self.target}, model: {self.model}]\n\n"
+                f"Gathered context ({len(context_text)} chars):\n\n"
+                f"{context_text}\n\n"
+                f"Question: {question}\n"
+                f"=== END DRY RUN ==="
+            )
+
+        # Step 3: Build messages
+        messages = list(self.conversation)  # copy history
+        messages.append({"role": "user", "content": user_message})
+
+        # Step 4: Call Claude
+        t0 = time.time()
+        response = self.client.messages.create(
+            model=self.model,
+            max_tokens=4096,
+            system=self._build_system_prompt(),
+            messages=messages,
+        )
+        elapsed = time.time() - t0
+
+        answer = response.content[0].text
+
+        # Step 5: Update conversation
+        self.conversation.append({"role": "user", "content": user_message})
+        self.conversation.append({"role": "assistant", "content": answer})
+
+        # Step 6: Usage stats
+        usage = response.usage
+        input_tokens = usage.input_tokens
+        output_tokens = usage.output_tokens
+        # Rough cost estimate (Sonnet 4 pricing: $3/MTok in, $15/MTok out)
+        cost = (input_tokens * 3 + output_tokens * 15) / 1_000_000
+
+        stats = (
+            f"\n--- {elapsed:.1f}s | "
+            f"{input_tokens} in + {output_tokens} out tokens | "
+            f"~${cost:.4f} ---"
+        )
+        return answer + stats
+
+    # -------------------------------------------------------------------
+    # Direct SQL passthrough
+    # -------------------------------------------------------------------
+
+    def sql(self, query: str) -> str:
+        """Execute a direct SQL query and return formatted results."""
+        try:
+            rows = self.conn.execute(query).fetchall()
+            desc = self.conn.description
+            if not rows:
+                return "(no rows)"
+            # Format as table
+            headers = [d[0] for d in desc]
+            col_widths = [len(h) for h in headers]
+            str_rows = []
+            for row in rows[:100]:
+                sr = []
+                for i, val in enumerate(row):
+                    if isinstance(val, int) and val > 0xFFFF:
+                        s = f"0x{val:08X}"
+                    else:
+                        s = str(val) if val is not None else "NULL"
+                    sr.append(s)
+                    if len(s) > col_widths[i]:
+                        col_widths[i] = min(len(s), 60)
+                str_rows.append(sr)
+
+            lines = []
+            header_line = "  ".join(h.ljust(col_widths[i]) for i, h in enumerate(headers))
+            lines.append(header_line)
+            lines.append("-" * len(header_line))
+            for sr in str_rows:
+                lines.append(
+                    "  ".join(
+                        s[:col_widths[i]].ljust(col_widths[i])
+                        for i, s in enumerate(sr)
+                    )
+                )
+            if len(rows) > 100:
+                lines.append(f"... ({len(rows)} total rows, showing first 100)")
+            return "\n".join(lines)
+        except Exception as exc:
+            return f"SQL error: {exc}"
+
+    # -------------------------------------------------------------------
+    # Interactive REPL
+    # -------------------------------------------------------------------
+
+    def interactive(self):
+        """Run interactive REPL."""
+        print(f"ripcord analyzer -- target: {self.target}")
+        print(f"  {self.target_summary}")
+        print(f"  model: {self.model}" + (" (dry-run)" if self.dry_run else ""))
+        print("  Type 'quit' to exit, 'clear' to reset, 'sql <query>' for direct SQL\n")
+
+        try:
+            import readline  # noqa: F401 -- enables line editing
+        except ImportError:
+            pass
+
+        while True:
+            try:
+                question = input("ripcord> ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                break
+
+            if not question:
+                continue
+            if question in ("quit", "exit"):
+                break
+            if question == "clear":
+                self.conversation = []
+                print("Conversation cleared.\n")
+                continue
+            if question.startswith("sql "):
+                result = self.sql(question[4:])
+                print(result)
+                print()
+                continue
+
+            print()
+            response = self.ask(question)
+            print(response)
+            print()
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "--target",
+        "-t",
+        required=True,
+        help="Target name (e.g. stock_v120, pico_blinky)",
+    )
+    parser.add_argument(
+        "--model",
+        "-m",
+        default="claude-sonnet-4-20250514",
+        help="Anthropic model to use (default: claude-sonnet-4-20250514)",
+    )
+    parser.add_argument(
+        "--build-dir",
+        default="build",
+        help="Build directory (default: build)",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show gathered context and prompt without calling the LLM",
+    )
+    parser.add_argument(
+        "question",
+        nargs="*",
+        help="Question to ask (omit for interactive mode)",
+    )
+    args = parser.parse_args()
+
+    analyzer = FirmwareAnalyzer(
+        target=args.target,
+        build_dir=args.build_dir,
+        model=args.model,
+        dry_run=args.dry_run,
+    )
+
+    if args.question:
+        question = " ".join(args.question)
+        response = analyzer.ask(question)
+        print(response)
+        return 0
+
+    # Interactive mode
+    analyzer.interactive()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
