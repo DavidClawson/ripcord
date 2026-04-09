@@ -42,6 +42,7 @@ eight Parquet tables per target under `build/<target>/tables/`:
 | `pcode_features`        | one row per function with P-Code opcode histogram and sequence hash |
 | `recovered_calls`       | one row per recovered indirect call edge (vector table, func ptr, veneer, registrar) |
 | `mmio_events`           | one row per MemoryIORead/Write from a Renode trace (scenario-scoped) |
+| `peripheral_xrefs`      | one row per peripheral register access from a function (SVD-resolved) |
 | `ground_truth_functions`| one row per `nm -S` T/t symbol (regression signal) |
 
 All tables are auto-discovered as DuckDB views by `scripts/query`.
@@ -80,15 +81,22 @@ firmware versions span V1.0.3-V1.2.0 (raw binary imports).
 
 ### Key empirical findings (newest first)
 
-1. **Multi-signal cross-compiler matching works.** Weighted
+1. **Agent swarm validated end-to-end.** Full loop: task generation
+   → context assembly → Claude API → response parsing → evidence
+   log → ground truth validation. On symboled target: 10/10 exact
+   matches (100%). On stripped binary (blind): 37/50 correct (74%
+   accuracy), 33 exact + 3 contained + 1 similar. Wrong cases are
+   veneer trampolines, tiny structural twins, printf internals.
+   Cost: $0.10/10 tasks. Confidence well-calibrated: wrong answers
+   0.75-0.85, correct answers 0.95-1.00.
+
+2. **Multi-signal cross-compiler matching works.** Weighted
    combination of 7 signals (size, blocks, calls, peripheral
    addresses, strings, body hash, read/write pattern) identifies
    functions across different compilers where single-signal matching
-   fails. First result: 6 high-confidence FreeRTOS matches in the
-   stock Keil firmware from GCC reference builds
-   (prvPortStartFirstTask, nvic_priority_group_config,
-   xTaskResumeAll, vTaskDelay, prvIdleTask, xTaskCreate). See
-   `notes/queries/multi_signal_score.sql`.
+   fails. 12 high-confidence matches in stock Keil firmware from
+   GCC reference builds. Standalone tool at
+   `scripts/match/match_functions.py`.
 
 2. **Constant-based fingerprinting: 100% precision, cross-compiler.**
    Three signals — peripheral register sets, full constant sets,
@@ -165,27 +173,18 @@ firmware versions span V1.0.3-V1.2.0 (raw binary imports).
 
 ### Current session's recommended next move
 
-**Peripheral-semantic function classification.** Using xrefs and a
-chip register map (SVD or manual), automatically classify every
-function by the peripherals it accesses (SPI driver, UART handler,
-DMA config, GPIO setup). Works on any Cortex-M target without
-reference builds. Would complement the multi-signal scorer by
-adding a hardware-semantic layer.
+**Open-source prep and v0.1.0 release.** The pipeline now has a
+compelling demo: drop in a binary, get peripheral access map +
+function identification + agent-powered naming. Missing: LICENSE,
+public README, CONTRIBUTING.md, strip proprietary notes.
 
-After that, three parallel threads:
+After that, two parallel threads:
 
-- **Expand the multi-signal scorer** into a standalone tool that
-  takes a reference ELF + target binary and produces a ranked
-  identification report. Current version is a SQL query; a Python
-  wrapper would make it usable in the agent swarm and the
-  interactive REPL.
-- **Ghidra import enhancement for raw binaries.** Feed vector table
-  addresses as function creation hints during import. Would improve
-  stock firmware function discovery (currently 305 functions; vector
-  table shows 20+ undiscovered entry points).
-- **Agent swarm dry run.** The Phase 3 infrastructure exists but
-  hasn't been exercised end-to-end. Running it on
-  `pico_freertos_hello` (ground truth) would validate the loop.
+- **Docker corpus builder.** Ubuntu aarch64 container with gcc +
+  llvm + armclang for reference corpora across compilers.
+- **Agent swarm accuracy improvements.** Feed peripheral_xrefs
+  context into agent prompts, add decompiled pseudo-C, improve
+  veneer handling. Then run on stock firmware targets.
 
 ## Non-goals and constraints (read carefully)
 

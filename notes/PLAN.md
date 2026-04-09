@@ -4,28 +4,34 @@ Broad, phased, intentionally preserving every thread from the design
 discussion. Steps within a phase are roughly sequential; phases overlap in
 practice.
 
-## Status snapshot (2026-04-08)
+## Status snapshot (2026-04-09)
 
 **Phase 0:** ✅ complete. 15 targets in warehouse (5 Pico + 2
-Zephyr + 1 stripped + 4 stock FNIRSI + 3 AT32 reference), nine
+Zephyr + 1 stripped + 4 stock FNIRSI + 3 AT32 reference), ten
 table types per target (`functions`, `calls`, `basic_blocks`,
 `xrefs`, `strings`, `pcode_features`, `recovered_calls`,
-`mmio_events`, `ground_truth_functions`).
+`peripheral_xrefs`, `mmio_events`, `ground_truth_functions`).
 
 **Phase 1:** library-ID validated end-to-end with multiple matching
 signals. Structural fingerprinting: 96% precision same-build. Blind
 recovery: 86.6% recall, 94.9% precision. P-Code: within-ISA 93-94%,
 cross-ISA fails (histogram cosine tested and killed). Constant
 fingerprinting: 100% precision, cross-compiler. Multi-signal
-cross-compiler scoring: 6 high-confidence FreeRTOS matches in stock
-Keil firmware from GCC reference builds. AT32F403A reference corpus
-built (GCC + LLVM). `vPortEnableVFP` byte-identical match confirms
-stock firmware uses FreeRTOS ARM_CM4F GCC port.
+cross-compiler scoring: 12 high-confidence matches in stock Keil
+firmware from GCC reference builds. AT32F403A reference corpus
+built (GCC + LLVM). Standalone scorer tool at
+`scripts/match/match_functions.py`.
+
+**Peripheral-semantic classification:** SVD-based register-level
+resolution for all 15 targets across 3 chip families (AT32F403A,
+RP2040, LM3S6965). 6171 peripheral xrefs classified. RP2040 atomic
+aliases (SET/CLR/XOR) auto-detected and resolved.
 
 **Computed call recovery:** 5 mechanisms at ~95% blended precision.
 Reachability gap: 70% unreachable → 12% truly unreachable. Works on
-ELF, stripped, and raw binary targets. Stock firmware: 37-47 edges
-including undiscovered vector table entry points.
+ELF, stripped, and raw binary targets. Ghidra vector table function
+creation (`create_vector_functions.py`) now runs as first postScript
+in extraction chain.
 
 **Phase 1 §1.3 (Renode):** proven standalone + wired into Snakemake.
 Renode boots Zephyr targets; 394 MMIO events from 2s boot. DAG
@@ -36,9 +42,15 @@ with recovered call edges. Souffle reachability on
 `pico_freertos_hello`: 211/265 reachable from `main` (79.6%) with
 recovery edges.
 
-**Phase 3 (Agent swarm):** infrastructure built (task queue, context
-assembly, worker, validation) but not exercised end-to-end on a real
-target.
+**Phase 3 (Agent swarm):** ✅ validated end-to-end on 2026-04-09.
+Full loop: task generation → context assembly → Claude API →
+response parsing → evidence log → ground truth validation. Results:
+- `pico_freertos_hello` (with symbols): 10/10 exact matches (100%)
+- `pico_freertos_hello_stripped` (blind): 37/50 correct (74%),
+  33 exact + 3 contained + 1 similar, 13 wrong. Wrong cases are
+  mostly veneer trampolines, tiny structural twins, and printf
+  internals. Cost: $0.10/10 tasks. Confidence calibrated: wrong
+  answers mostly 0.75-0.85, correct answers 0.95-1.00.
 
 **Phases 2.2+ (angr), 4 (Unicorn verification):** not started.
 
@@ -502,32 +514,44 @@ Things that are tempting but should wait:
   should live in a `platform_quirks` table and in comments in the
   Renode `.repl` file. Losing them is expensive.
 
-## Highest-leverage single action right now (updated 2026-04-08)
+## Highest-leverage single action right now (updated 2026-04-09)
 
-**Peripheral-semantic function classification.** Using xrefs + a
-chip register map (SVD file or manual JSON), classify every function
-by the hardware peripherals it accesses. This works on any Cortex-M
-target without reference builds and provides the most immediately
-useful output for firmware RE: "this function is an SPI driver,"
-"this function configures DMA," etc. The data is already in the
-warehouse; the missing piece is a peripheral register map per chip.
+**Open-source prep and v0.1.0 release.** The pipeline now has a
+compelling end-to-end demo: drop in a binary, get peripheral access
+map + function identification + agent-powered naming. The missing
+pieces for a public release are LICENSE, public README with
+quick-start, CONTRIBUTING.md, and stripping proprietary notes.
 
-After that, three parallel threads:
+After that, two parallel threads:
 
-- **Productize the multi-signal scorer.** Wrap
-  `notes/queries/multi_signal_score.sql` in a Python tool that
-  takes reference + target and produces a ranked identification
-  report. Integrate into the agent swarm and interactive REPL.
+- **Docker corpus builder.** Ubuntu aarch64 container with gcc +
+  llvm + armclang for building reference corpora across multiple
+  compilers. The armclang gap is the biggest remaining obstacle for
+  stock firmware matching.
 
-- **Ghidra import enhancement for raw binaries.** Feed vector table
-  addresses as function creation hints. Stock firmware currently has
-  305 Ghidra-discovered functions but 20+ undiscovered ISR handlers
-  visible in the vector table.
+- **Agent swarm scaling.** The 74% blind accuracy has clear
+  improvement paths: feed peripheral_xrefs context to the agent
+  (currently not in the prompt), add decompiled pseudo-C context,
+  and improve veneer/trampoline handling. Also: run on stock
+  firmware targets where the agent would be discovering truly
+  unknown functions.
 
-- **Agent swarm dry run.** Validate the Phase 3 infrastructure
-  end-to-end on `pico_freertos_hello` (ground truth available).
+**Done this session (2026-04-09):**
 
-**Done this session (2026-04-08):**
+- ~~Peripheral-semantic classification~~ → SVD-based, 3 chip
+  families, 6171 xrefs across 15 targets, RP2040 atomic aliases.
+  See `scripts/peripheral/`, `peripheral_summary.sql`.
+- ~~Standalone scorer tool~~ → `scripts/match/match_functions.py`.
+  12 high-confidence matches on stock firmware.
+- ~~Ghidra vector table function creation~~ →
+  `create_vector_functions.py` as first postScript in chain.
+- ~~RP2040 atomic alias support~~ → auto-detect, SET/CLR/XOR
+  resolved, zero UNKNOWN on Pico targets.
+- ~~Agent swarm dry run~~ → validated end-to-end. 100% exact on
+  symboled target, 74% accuracy on stripped blind recovery.
+  $0.10/10 tasks. Confidence well-calibrated.
+
+**Done in previous session (2026-04-08):**
 
 - ~~P-Code histogram cosine cross-ISA~~ → killed. 92% of pairs
   score >= 0.80, no discrimination. See `pcode_cosine.sql`.
