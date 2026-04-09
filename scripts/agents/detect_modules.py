@@ -33,6 +33,7 @@ if _AGENTS_DIR not in sys.path:
     sys.path.insert(0, _AGENTS_DIR)
 
 from context import register_warehouse, _get_decompiled_c
+from peripheral_affinity import compute_transitive_affinity, get_primary_peripheral
 from worker import call_claude, log_agent_run
 
 
@@ -723,20 +724,32 @@ def run_detection(
     all_addrs = {r[0] for r in all_fn_rows}
     print(f"detect_modules: {len(all_addrs)} functions in {target}")
 
-    # --- Pass 1: Peripheral-based seed clusters ---
-    print("\nPass 1: Peripheral-based seed clusters...")
-    clusters = build_peripheral_clusters(conn_duckdb, target)
-    if clusters:
+    # --- Pass 1: Peripheral-based seed clusters (transitive) ---
+    print("\nPass 1: Transitive peripheral affinity clustering...")
+    affinities = compute_transitive_affinity(conn_duckdb, target)
+    if affinities:
+        # Cluster by primary peripheral (highest affinity score)
+        clusters: dict[str, list[int]] = {}
+        for addr, aff in affinities.items():
+            primary = get_primary_peripheral(aff)
+            if primary:
+                clusters.setdefault(primary, []).append(addr)
+        direct_clusters = build_peripheral_clusters(conn_duckdb, target)
+        n_direct = sum(len(v) for v in direct_clusters.values())
+        n_transitive = sum(len(v) for v in clusters.values())
+        print(f"  transitive: {n_transitive} functions clustered "
+              f"(vs {n_direct} from direct xrefs only)")
         for name, addrs in sorted(clusters.items(), key=lambda x: -len(x[1])):
             print(f"  {name}: {len(addrs)} functions")
     else:
-        print("  (no peripheral_xrefs data — skipping peripheral seeding)")
+        print("  (no peripheral data — falling back to direct xrefs)")
+        clusters = build_peripheral_clusters(conn_duckdb, target)
 
     # Track assignment methods per cluster
     # Key: cluster_name -> { method -> count }
     per_cluster_methods: dict[str, dict[str, int]] = {}
     for cname, addrs in clusters.items():
-        per_cluster_methods[cname] = {"peripheral_seed": len(addrs)}
+        per_cluster_methods[cname] = {"transitive_affinity": len(addrs)}
 
     # --- Pass 2: Call-graph expansion ---
     print("\nPass 2: Call-graph expansion...")

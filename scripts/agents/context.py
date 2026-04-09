@@ -22,9 +22,19 @@ Usage:
 from __future__ import annotations
 
 import json
+import sqlite3
+import sys
 from pathlib import Path
 
 import duckdb
+
+# Ensure sibling modules are importable
+_AGENTS_DIR = str(Path(__file__).resolve().parent)
+if _AGENTS_DIR not in sys.path:
+    sys.path.insert(0, _AGENTS_DIR)
+
+from register_map import decode_register, annotate_decompiled_c, REGISTER_NAMES
+from peripheral_affinity import compute_transitive_affinity, format_affinity_context
 
 
 # ---------------------------------------------------------------------------
@@ -85,11 +95,73 @@ def register_warehouse(
 # ---------------------------------------------------------------------------
 
 
+def _get_module_info(
+    conn_sqlite: sqlite3.Connection | None,
+    target: str,
+    function_addr: int,
+) -> dict | None:
+    """Get module membership for a function from the coordination DB."""
+    if conn_sqlite is None:
+        return None
+    try:
+        row = conn_sqlite.execute(
+            """
+            SELECT m.module_name, m.description, m.function_count, m.seed_peripheral
+            FROM function_modules fm
+            JOIN modules m ON m.id = fm.module_id
+            WHERE fm.target = ? AND fm.function_addr = ?
+            """,
+            (target, function_addr),
+        ).fetchone()
+        if row:
+            return {
+                "module_name": row[0],
+                "description": row[1],
+                "function_count": row[2],
+                "seed_peripheral": row[3],
+            }
+    except Exception:
+        pass
+    return None
+
+
+def _batch_module_lookup(
+    conn_sqlite: sqlite3.Connection | None,
+    target: str,
+    addrs: list[int],
+) -> dict[int, str | None]:
+    """Batch-query module names for a list of function addresses.
+
+    Returns a dict mapping address -> module_name (or None).
+    """
+    result: dict[int, str | None] = {a: None for a in addrs}
+    if conn_sqlite is None or not addrs:
+        return result
+    try:
+        placeholders = ",".join("?" for _ in addrs)
+        rows = conn_sqlite.execute(
+            f"""
+            SELECT fm.function_addr, m.module_name
+            FROM function_modules fm
+            JOIN modules m ON m.id = fm.module_id
+            WHERE fm.target = ? AND fm.function_addr IN ({placeholders})
+            """,
+            [target] + addrs,
+        ).fetchall()
+        for addr, module_name in rows:
+            result[addr] = module_name
+    except Exception:
+        pass
+    return result
+
+
 def assemble_propose_name_context(
     conn: duckdb.DuckDBPyConnection,
     target: str,
     function_addr: int,
     domain_hint: str | None = None,
+    conn_sqlite: sqlite3.Connection | None = None,
+    peripheral_affinities: dict[int, dict[str, float]] | None = None,
 ) -> dict:
     """Query the warehouse and return everything the LLM needs to name a function.
 
@@ -239,6 +311,16 @@ def assemble_propose_name_context(
         for r in caller_rows
     ]
 
+    # Add module membership to callers and callees (batch query)
+    all_neighbor_addrs = (
+        [r[0] for r in callee_rows] + [r[0] for r in caller_rows]
+    )
+    mod_map = _batch_module_lookup(conn_sqlite, target, all_neighbor_addrs)
+    for entry in ctx["callees"]:
+        entry["module"] = mod_map.get(int(entry["addr"], 16))
+    for entry in ctx["callers"]:
+        entry["module"] = mod_map.get(int(entry["addr"], 16))
+
     # --- (c) Referenced strings ---
     string_rows = conn.execute(
         """
@@ -317,11 +399,19 @@ def assemble_propose_name_context(
         for r in periph_rows
     ]
 
-    # --- (g) Decompiled pseudo-C ---
+    # --- (g) Transitive peripheral affinity ---
+    # Caller can pre-compute and pass in via peripheral_affinities kwarg
+    # to avoid recomputing the full graph per function.
+    ctx["peripheral_affinity"] = peripheral_affinities.get(function_addr, {}) if peripheral_affinities else {}
+
+    # --- (h) Decompiled pseudo-C ---
     ctx["decompiled_c"] = _get_decompiled_c(conn, target, function_addr)
 
-    # --- (h) Domain hint ---
+    # --- (i) Domain hint ---
     ctx["domain_hint"] = domain_hint
+
+    # --- (j) Module membership ---
+    ctx["module_info"] = _get_module_info(conn_sqlite, target, function_addr)
 
     return ctx
 
@@ -473,6 +563,18 @@ def format_propose_name_prompt(ctx: dict) -> str:
             f"Use domain-appropriate naming when the evidence supports it."
         )
 
+    # Module membership
+    if ctx.get("module_info"):
+        mi = ctx["module_info"]
+        lines = ["## Module membership"]
+        lines.append(f"This function belongs to: **{mi['module_name']}**")
+        if mi.get("description"):
+            lines.append(f"Module description: {mi['description']}")
+        lines.append(f"Module size: {mi['function_count']} functions")
+        if mi.get("seed_peripheral"):
+            lines.append(f"Seed peripheral: {mi['seed_peripheral']}")
+        sections.append("\n".join(lines))
+
     # Target function
     lines = [
         "## Target function",
@@ -514,7 +616,8 @@ def format_propose_name_prompt(ctx: dict) -> str:
         for c in ctx["callers"]:
             name = _best_name(c)
             conf = f" (confidence: {c['confidence']:.2f})" if c.get("confidence") else ""
-            lines.append(f"- {name} @ {c['addr']}{conf}")
+            mod = f" [{c['module']}]" if c.get("module") else ""
+            lines.append(f"- {name} @ {c['addr']}{conf}{mod}")
         sections.append("\n".join(lines))
 
     # Callees
@@ -523,7 +626,8 @@ def format_propose_name_prompt(ctx: dict) -> str:
         for c in ctx["callees"]:
             name = _best_name(c)
             conf = f" (confidence: {c['confidence']:.2f})" if c.get("confidence") else ""
-            lines.append(f"- {name} @ {c['addr']}{conf}")
+            mod = f" [{c['module']}]" if c.get("module") else ""
+            lines.append(f"- {name} @ {c['addr']}{conf}{mod}")
         sections.append("\n".join(lines))
 
     # Referenced strings
@@ -555,6 +659,10 @@ def format_propose_name_prompt(ctx: dict) -> str:
         for pa in ctx["peripheral_accesses"]:
             lines.append(f"- {pa['register']} ({pa['peripheral']}, {pa['group']}): {pa['ref_type']}")
         sections.append("\n".join(lines))
+
+    # Transitive peripheral affinity
+    if ctx.get("peripheral_affinity"):
+        sections.append(f"## {format_affinity_context(ctx['peripheral_affinity'])}")
 
     # Decompiled pseudo-C
     if ctx.get("decompiled_c"):
@@ -683,25 +791,6 @@ def format_analysis_prompt(context: dict, question: str) -> str:
     return "\n\n".join(sections)
 
 
-# ---------------------------------------------------------------------------
-# Well-known peripheral register names (AT32F403A / STM32F4-family)
-# ---------------------------------------------------------------------------
-
-_PERIPHERAL_REGISTER_NAMES: dict[int, str] = {
-    0x40004404: "USART2_DR",
-    0x40004804: "USART3_DR",
-    0x40013804: "USART1_DR",
-    0x40003C0C: "SPI3_DR",
-    0x40003804: "SPI2_DR",
-    0x40013004: "SPI1_DR",
-    0x40020444: "DMA1_CMAR2",
-    0x40020458: "DMA1_CMAR3",
-    0x4002046C: "DMA1_CMAR4",
-    0x40020480: "DMA1_CMAR5",
-    0x40020494: "DMA1_CMAR6",
-    0x400204A8: "DMA1_CMAR7",
-}
-
 # Maximum decompiled C length to include in a trace prompt (chars).
 _MAX_DECOMPILED_C_LEN = 10_000
 
@@ -722,6 +811,7 @@ def _get_decompiled_c(
     c_text = row[0]
     if len(c_text) > _MAX_DECOMPILED_C_LEN:
         c_text = c_text[:_MAX_DECOMPILED_C_LEN] + f"\n\n... [truncated at {_MAX_DECOMPILED_C_LEN} chars, original {len(row[0])} chars]"
+    c_text = annotate_decompiled_c(c_text)
     return c_text
 
 
@@ -768,9 +858,7 @@ def assemble_trace_data_source_context(
     }
 
     # --- (b) Register info ---
-    reg_name = _PERIPHERAL_REGISTER_NAMES.get(
-        register_addr, f"REG_0x{register_addr:08x}"
-    )
+    reg_name = decode_register(register_addr)
     ctx["register"] = {
         "addr": f"0x{register_addr:08x}",
         "name": reg_name,

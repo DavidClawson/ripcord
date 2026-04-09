@@ -42,6 +42,7 @@ from context import (
     format_propose_name_prompt,
     register_warehouse,
 )
+from peripheral_affinity import compute_transitive_affinity
 from worker import (
     call_claude,
     claim_next_task,
@@ -421,6 +422,7 @@ def run_round_worker(
     domain_hint: str | None,
     dry_run: bool,
     concurrency: int = 5,
+    peripheral_affinities: dict | None = None,
 ) -> dict:
     """Process all pending tasks for this round with parallel API calls.
 
@@ -441,7 +443,10 @@ def run_round_worker(
         addr = task["entity_addr"]
         try:
             ctx = assemble_propose_name_context(
-                conn_duckdb, target, addr, domain_hint=domain_hint,
+                conn_duckdb, target, addr,
+                domain_hint=domain_hint,
+                conn_sqlite=conn_sqlite,
+                peripheral_affinities=peripheral_affinities,
             )
             prompt = format_propose_name_prompt(ctx)
             work_items.append((task, prompt))
@@ -775,6 +780,15 @@ def run_propagation(
     print(f"propagate: {total_functions} functions in {target}"
           + (f" ({data_count} data, {analyzable} analyzable)" if data_count else ""))
 
+    # Compute transitive peripheral affinities once (shared across all rounds)
+    print("propagate: computing transitive peripheral affinities...")
+    try:
+        peripheral_affinities = compute_transitive_affinity(conn_duckdb, target)
+        print(f"propagate: {len(peripheral_affinities)} functions with peripheral affinity")
+    except Exception as exc:
+        print(f"propagate: peripheral affinity failed ({exc}), continuing without")
+        peripheral_affinities = None
+
     agent_id = f"propagate-{uuid4().hex[:8]}"
     cumulative_cost = 0.0
     cumulative_tokens_in = 0
@@ -820,6 +834,7 @@ def run_propagation(
         result = run_round_worker(
             conn_sqlite, conn_duckdb, target, round_num,
             model, agent_id, domain_hint, dry_run, concurrency,
+            peripheral_affinities=peripheral_affinities,
         )
 
         cumulative_cost += result["cost_usd"]
