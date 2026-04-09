@@ -23,7 +23,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     kind            TEXT NOT NULL CHECK (kind IN (
                         'propose_name', 'propose_contract',
                         'classify_register', 'describe_function',
-                        'resolve_conflict', 'trace_data_source'
+                        'describe_phase', 'resolve_conflict',
+                        'trace_data_source'
                     )),
     target          TEXT NOT NULL,
     entity_addr     INTEGER NOT NULL,
@@ -55,7 +56,7 @@ CREATE TABLE IF NOT EXISTS evidence_log (
     agent_id        TEXT NOT NULL,
     claim_type      TEXT NOT NULL CHECK (claim_type IN (
                         'name', 'contract', 'register_role', 'description',
-                        'data_trace'
+                        'phase_description', 'data_trace'
                     )),
     claim_json      TEXT NOT NULL,
     confidence      REAL NOT NULL CHECK (confidence >= 0.0 AND confidence <= 1.0),
