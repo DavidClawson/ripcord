@@ -1,0 +1,138 @@
+// reachability.dl — Stage 4 derivation layer: transitive call reachability
+//
+// Base facts are exported from the ripcord warehouse (calls + functions
+// tables) as tab-separated .facts files. Souffle derives transitive
+// reachability, orchestrator scores, and shared-callee clusters.
+//
+// Usage:
+//   cd build/<target>/datalog
+//   souffle /path/to/scripts/datalog/reachability.dl
+//
+// Inputs:  calls.facts       (caller_addr, callee_addr)
+//          functions.facts   (addr, name)
+// Outputs: reaches.csv       (caller, callee) — transitive closure
+//          reach_count.csv   (addr, name, count) — per-function reach size
+//          orchestrators.csv (addr, name, direct_callees, transitive_reach)
+//          unreachable_from_main.csv (addr, name) — not in main's closure
+
+// --- Base relations ---
+
+.decl calls(caller: unsigned, callee: unsigned)
+.input calls(IO="file", filename="calls.facts", delimiter="\t")
+
+.decl function_name(addr: unsigned, name: symbol)
+.input function_name(IO="file", filename="functions.facts", delimiter="\t")
+
+// --- Derived: transitive reachability ---
+
+.decl reaches(src: unsigned, dst: unsigned)
+reaches(a, b) :- calls(a, b).
+reaches(a, c) :- reaches(a, b), calls(b, c).
+
+// --- Helper: per-function transitive reach set membership ---
+
+.decl has_reach(addr: unsigned)
+has_reach(a) :- reaches(a, _).
+
+// --- Derived: per-function transitive reach count ---
+
+.decl reach_count(addr: unsigned, name: symbol, n: number)
+reach_count(a, name, c) :-
+    function_name(a, name),
+    has_reach(a),
+    c = count : { reaches(a, _) }.
+
+// Zero-reach for functions with no outgoing edges
+reach_count(a, name, 0) :-
+    function_name(a, name),
+    !has_reach(a).
+
+// --- Derived: direct fan-out ---
+
+.decl has_callees(addr: unsigned)
+has_callees(a) :- calls(a, _).
+
+.decl direct_callees(addr: unsigned, n: number)
+direct_callees(a, c) :-
+    function_name(a, _),
+    has_callees(a),
+    c = count : { calls(a, _) }.
+
+direct_callees(a, 0) :-
+    function_name(a, _),
+    !has_callees(a).
+
+// --- Derived: orchestrator detection ---
+// An orchestrator has both high direct fan-out and high transitive reach.
+
+.decl orchestrator(addr: unsigned, name: symbol, direct: number, transitive: number)
+orchestrator(a, name, d, t) :-
+    function_name(a, name),
+    direct_callees(a, d),
+    reach_count(a, _, t),
+    d >= 5,
+    t >= 20.
+
+// --- Derived: reachability from main ---
+
+.decl main_addr(addr: unsigned)
+main_addr(a) :- function_name(a, "main").
+
+.decl reachable_from_main(addr: unsigned)
+reachable_from_main(b) :- main_addr(a), reaches(a, b).
+
+.decl unreachable_from_main(addr: unsigned, name: symbol)
+unreachable_from_main(a, name) :-
+    function_name(a, name),
+    !reachable_from_main(a),
+    !main_addr(a).
+
+// --- Derived: reachability from any entry point (main + hardware roots) ---
+
+.decl entry_point(addr: unsigned)
+.input entry_point(IO="file", filename="entry_points.facts", delimiter="\t")
+
+// Fall back to just main if entry_points.facts does not exist
+entry_point(a) :- main_addr(a).
+
+.decl reachable_from_any_entry(addr: unsigned)
+reachable_from_any_entry(a) :- entry_point(a).
+reachable_from_any_entry(b) :- entry_point(a), reaches(a, b).
+
+.decl truly_unreachable(addr: unsigned, name: symbol)
+truly_unreachable(a, name) :-
+    function_name(a, name),
+    !reachable_from_any_entry(a).
+
+// --- Derived: shared-callee pairs (subsystem clustering signal) ---
+// Two callers that share at least 3 callees are likely in the same subsystem.
+
+.decl shared_callee(a: unsigned, b: unsigned, callee: unsigned)
+shared_callee(a, b, c) :-
+    calls(a, c),
+    calls(b, c),
+    a < b.
+
+.decl has_shared(a: unsigned, b: unsigned)
+has_shared(a, b) :- shared_callee(a, b, _).
+
+.decl shared_callee_count(a: unsigned, b: unsigned, n: number)
+shared_callee_count(a, b, n) :-
+    has_shared(a, b),
+    n = count : { shared_callee(a, b, _) },
+    n >= 3.
+
+.decl subsystem_pair(name_a: symbol, name_b: symbol, shared: number)
+subsystem_pair(na, nb, n) :-
+    shared_callee_count(a, b, n),
+    function_name(a, na),
+    function_name(b, nb).
+
+// --- Outputs ---
+
+.output reaches(IO="file", filename="reaches.csv", delimiter="\t")
+.output reach_count(IO="file", filename="reach_count.csv", delimiter="\t")
+.output orchestrator(IO="file", filename="orchestrators.csv", delimiter="\t")
+.output unreachable_from_main(IO="file", filename="unreachable_from_main.csv", delimiter="\t")
+.output subsystem_pair(IO="file", filename="subsystem_pairs.csv", delimiter="\t")
+.output truly_unreachable(IO="file", filename="truly_unreachable.csv", delimiter="\t")

@@ -1,0 +1,34 @@
+// TI Stellaris LM3S6965 platform definition for Renode
+// This is the board targeted by Zephyr's qemu_cortex_m3 BSP.
+//
+// Memory map from TI LM3S6965 datasheet:
+//   Flash:  0x00000000 - 0x0003FFFF (256 KB)
+//   SRAM:   0x20000000 - 0x2000FFFF (64 KB)
+//   UART0:  0x4000C000
+//   UART1:  0x4000D000
+//   UART2:  0x4001C000
+//   NVIC:   0xE000E000
+
+flash: Memory.MappedMemory @ sysbus 0x00000000
+    size: 0x00040000
+
+sram: Memory.MappedMemory @ sysbus 0x20000000
+    size: 0x00010000
+
+nvic: IRQControllers.NVIC @ sysbus 0xE000E000
+    priorityMask: 0xF0
+    systickFrequency: 50000000
+    IRQ -> cpu@0
+
+cpu: CPU.CortexM @ sysbus
+    cpuType: "cortex-m3"
+    nvic: nvic
+
+uart0: UART.PL011 @ sysbus 0x4000C000
+    -> nvic@5
+
+uart1: UART.PL011 @ sysbus 0x4000D000
+    -> nvic@6
+
+uart2: UART.PL011 @ sysbus 0x4001C000
+    -> nvic@33

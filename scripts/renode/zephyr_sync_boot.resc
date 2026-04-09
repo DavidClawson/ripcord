@@ -1,0 +1,35 @@
+# Renode scenario: Boot Zephyr synchronization sample on LM3S6965
+#
+# Usage (from repo root):
+#   /Applications/Renode.app/Contents/MacOS/renode --disable-xwt --console \
+#       scripts/renode/zephyr_sync_boot.resc
+#
+# What it does:
+#   1. Creates machine from LM3S6965 platform definition
+#   2. Loads the Zephyr synchronization ELF (two threads, semaphores)
+#   3. Enables UART console output
+#   4. Enables execution tracing with memory access tracking
+#   5. Runs for 5 virtual seconds (enough for several thread alternations), then quits
+#
+# Outputs:
+#   build/renode_sync_boot.log         — Renode session log (MMIO warnings, UART output)
+#   build/renode_sync_boot_trace.log   — Per-instruction execution trace with MMIO events
+
+mach create
+machine LoadPlatformDescription @scripts/renode/lm3s6965.repl
+
+sysbus LoadELF @targets/zephyr_synchronization/zephyr.elf
+
+showAnalyzer uart0
+
+# Verbose sysbus logging captures unmapped peripheral accesses
+logLevel -1 sysbus
+logFile $CWD/build/renode_sync_boot.log true
+
+# Execution trace: PC+opcode for every instruction, plus MemoryIORead/Write
+# for every bus access. This is the primary MMIO trace source.
+cpu CreateExecutionTracing "tracer" $CWD/build/renode_sync_boot_trace.log PCAndOpcode
+tracer TrackMemoryAccesses
+
+emulation RunFor "0:0:5"
+quit

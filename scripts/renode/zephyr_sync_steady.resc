@@ -1,0 +1,40 @@
+# Renode scenario: Steady-state Zephyr synchronization on LM3S6965
+#
+# Usage (from repo root):
+#   /Applications/Renode.app/Contents/MacOS/renode --disable-xwt --console \
+#       scripts/renode/zephyr_sync_steady.resc
+#
+# What it does:
+#   1. Creates machine from LM3S6965 platform definition
+#   2. Loads the Zephyr synchronization ELF (two threads, semaphores)
+#   3. Enables UART console output
+#   4. Enables execution tracing with memory access tracking
+#   5. Runs for 20 virtual seconds to capture steady-state thread scheduling
+#
+# This captures the repeating pattern: threadA takes semA, prints, gives semB;
+# threadB takes semB, prints, gives semA. The longer run yields many more
+# NVIC events (context switches) and UART events (print output) than the
+# 5-second boot scenario.
+#
+# Outputs:
+#   build/renode_sync_steady.log         — Renode session log
+#   build/renode_sync_steady_trace.log   — Per-instruction execution trace with MMIO events
+
+mach create
+machine LoadPlatformDescription @scripts/renode/lm3s6965.repl
+
+sysbus LoadELF @targets/zephyr_synchronization/zephyr.elf
+
+showAnalyzer uart0
+
+# Verbose sysbus logging captures unmapped peripheral accesses
+logLevel -1 sysbus
+logFile $CWD/build/renode_sync_steady.log true
+
+# Execution trace: PC+opcode for every instruction, plus MemoryIORead/Write
+# for every bus access. This is the primary MMIO trace source.
+cpu CreateExecutionTracing "tracer" $CWD/build/renode_sync_steady_trace.log PCAndOpcode
+tracer TrackMemoryAccesses
+
+emulation RunFor "0:0:20"
+quit
