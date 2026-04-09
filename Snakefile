@@ -69,6 +69,7 @@ rule all:
         expand("build/{target}/tables/xrefs.parquet",        target=TARGETS),
         expand("build/{target}/tables/strings.parquet",      target=TARGETS),
         expand("build/{target}/tables/pcode_features.parquet", target=TARGETS),
+        expand("build/{target}/tables/recovered_calls.parquet", target=TARGETS),
         expand("build/{target}/tables/ground_truth_functions.parquet", target=TARGETS),
         expand("build/{target}/tables/functions_enriched.parquet", target=TARGETS),
         all_renode_outputs(),
@@ -229,6 +230,36 @@ rule ingest_pcode:
         """
 
 
+rule recover_calls:
+    """Recover indirect call edges from existing warehouse tables + binary.
+
+    Runs the standalone recovery script (no Ghidra session needed) which:
+    1. Reads Cortex-M vector table from the binary → ISR handlers
+    2. Scans xrefs table for non-call refs to function entries → func ptrs
+    3. Infers registrar→callback dispatch edges from calls + xrefs
+
+    Produces recovered_calls.jsonl, then ingests to Parquet.
+    """
+    input:
+        functions = "build/{target}/tables/functions.parquet",
+        calls = "build/{target}/tables/calls.parquet",
+        xrefs = "build/{target}/tables/xrefs.parquet",
+        elf = lambda wc: config["targets"][wc.target]["elf"],
+    output:
+        parquet = "build/{target}/tables/recovered_calls.parquet",
+    params:
+        jsonl = "build/{target}/recovered_calls.jsonl",
+    shell:
+        r"""
+        {PYTHON} scripts/recovery/recover_calls.py {wildcards.target}
+        {PYTHON} scripts/ingest/load_table.py \
+            --table recovered_calls \
+            --source {wildcards.target} \
+            --output {output.parquet} \
+            {params.jsonl}
+        """
+
+
 rule ground_truth_functions:
     """Extract ground-truth text symbols from the ELF via `nm -S`.
 
@@ -341,11 +372,13 @@ rule datalog_export:
     """Export base facts from the warehouse for Souffle consumption.
 
     Produces tab-separated .facts files (no header) matching the .input
-    declarations in reachability.dl.
+    declarations in reachability.dl. Includes recovered call edges from
+    vector table, function-pointer references, and registrar dispatch.
     """
     input:
         calls = "build/{target}/tables/calls.parquet",
         functions = "build/{target}/tables/functions.parquet",
+        recovered_calls = "build/{target}/tables/recovered_calls.parquet",
     output:
         calls_facts = "build/{target}/datalog/calls.facts",
         functions_facts = "build/{target}/datalog/functions.facts",

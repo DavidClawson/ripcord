@@ -326,6 +326,49 @@ def decompiled_row(rec: dict, source: str, extracted_at) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# recovered_calls — call edges recovered from indirect dispatch patterns
+# ---------------------------------------------------------------------------
+#
+# Populated by export_recovered_calls.py running inside Ghidra. Each row
+# is a call edge that Ghidra's standard call analysis missed: ISR vector
+# table entries, function-pointer references passed to registrar functions,
+# veneer trampolines, etc. The mechanism column tags how the edge was
+# recovered; confidence is a float reflecting reliability.
+#
+# caller_addr is NULL for vector_table entries (hardware entry, no caller).
+# call_site_addr is NULL for registrar_dispatch entries (inferred, no
+# specific instruction).
+
+RECOVERED_CALLS_SCHEMA = pa.schema(
+    [
+        ("source", pa.string()),
+        ("caller_addr", pa.int64()),  # nullable for vector_table
+        ("callee_addr", pa.int64()),
+        ("call_site_addr", pa.int64()),  # nullable for inferred edges
+        ("mechanism", pa.string()),  # vector_table, func_ptr_ref, veneer_jump, registrar_dispatch
+        ("confidence", pa.float64()),
+        ("detail", pa.string()),
+        ("extracted_at", pa.timestamp("us", tz="UTC")),
+    ]
+)
+
+
+def recovered_calls_row(rec: dict, source: str, extracted_at) -> dict:
+    caller = rec.get("caller_addr")
+    site = rec.get("call_site_addr")
+    return {
+        "source": source,
+        "caller_addr": int(caller) if caller is not None else None,
+        "callee_addr": int(rec["callee_addr"]),
+        "call_site_addr": int(site) if site is not None else None,
+        "mechanism": rec.get("mechanism") or "",
+        "confidence": float(rec.get("confidence", 0.5)),
+        "detail": rec.get("detail") or "",
+        "extracted_at": extracted_at,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Registry
 # ---------------------------------------------------------------------------
 
@@ -338,6 +381,7 @@ TABLES: dict[str, pa.Schema] = {
     "pcode_features": PCODE_FEATURES_SCHEMA,
     "mmio_events": MMIO_EVENTS_SCHEMA,
     "decompiled": DECOMPILED_SCHEMA,
+    "recovered_calls": RECOVERED_CALLS_SCHEMA,
 }
 
 ROW_TRANSFORMS: dict[str, Callable] = {
@@ -349,4 +393,5 @@ ROW_TRANSFORMS: dict[str, Callable] = {
     "pcode_features": pcode_features_row,
     "mmio_events": mmio_events_row,
     "decompiled": decompiled_row,
+    "recovered_calls": recovered_calls_row,
 }

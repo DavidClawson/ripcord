@@ -40,6 +40,7 @@ eight Parquet tables per target under `build/<target>/tables/`:
 | `xrefs`                 | one row per non-call reference (reads, writes, jumps, data) |
 | `strings`               | one row per defined string in loaded memory    |
 | `pcode_features`        | one row per function with P-Code opcode histogram and sequence hash |
+| `recovered_calls`       | one row per recovered indirect call edge (vector table, func ptr, veneer, registrar) |
 | `mmio_events`           | one row per MemoryIORead/Write from a Renode trace (scenario-scoped) |
 | `ground_truth_functions`| one row per `nm -S` T/t symbol (regression signal) |
 
@@ -70,7 +71,17 @@ config (M3, -Os, picolibc).
 
 ### Key empirical findings (newest first)
 
-1. **Blind recovery on stripped binary: 86.6% recall, 94.9%
+1. **Computed call recovery closes the reachability gap from 70%
+   unreachable to 12%.** Five recovery mechanisms (vector table,
+   binary constant scan, xref-based func-ptr refs, veneer jumps,
+   registrar dispatch inference) recover 67-188 edges per target.
+   On `pico_freertos_hello`: 212/265 functions reachable from
+   `main` (80.0%, up from 30.6%); only 32 truly unreachable from
+   all entry points (12.1%). Works on stripped binaries. See
+   `scripts/recovery/recover_calls.py` and
+   `notes/queries/recovered_calls.sql`.
+
+2. **Blind recovery on stripped binary: 86.6% recall, 94.9%
    precision.** `pico_freertos_hello_stripped` (symbols removed)
    was matched against the full-symbol `pico_freertos_hello` and
    `pico_freertos_static` using structural 8-tuple + body_hash.
@@ -80,7 +91,7 @@ config (M3, -Os, picolibc).
    expected failure mode. This is the first end-to-end blind
    recovery demonstration.
 
-2. **P-Code cross-ISA: exact hash fails, within-ISA works
+3. **P-Code cross-ISA: exact hash fails, within-ISA works
    (93-100%), histogram similarity is the path forward.** Exact
    `pcode_sequence_hash` matching across Cortex-M0+ vs Cortex-M3
    produces zero true positives — register allocation and calling
@@ -90,7 +101,7 @@ config (M3, -Os, picolibc).
    opcode histogram cosine similarity, not exact hashes. See
    `notes/queries/cross_isa_pcode.sql`.
 
-3. **Renode traces: 394 MMIO events from 2s boot, function-to-MMIO
+4. **Renode traces: 394 MMIO events from 2s boot, function-to-MMIO
    correlation working.** Renode v1.16.1 boots `zephyr_hello_world`
    on a custom LM3S6965 platform file. The execution trace captures
    per-instruction MMIO reads/writes with PC attribution. 214
@@ -98,45 +109,44 @@ config (M3, -Os, picolibc).
    the warehouse and joinable to `functions` by PC. See
    `notes/renode-setup.md`.
 
-4. **Datalog: 80/265 functions reachable from main, 70% unreachable
-   = ISR/callback surface.** Souffle reachability derivation on
-   `pico_freertos_hello` finds 80 functions reachable from `main`
-   via direct calls (max depth 8). The 184 unreachable functions
-   are ISR handlers, FreeRTOS task functions, and callback targets
-   — exactly the set that needs computed-call-target recovery. Top
-   orchestrators: `main_task` (79 transitive reach),
-   `async_context_task` (41), `vTaskStartScheduler` (40). See
-   `notes/datalog-baseline.md`.
+5. **Datalog reachability with recovered edges: 80% reachable from
+   main.** Souffle reachability on `pico_freertos_hello` with
+   static + recovered call edges: 212/265 functions reachable from
+   `main` (80.0%). Only 32 truly unreachable from all entry points
+   (12.1%). The remaining unreachable functions are genuine leaf
+   callbacks (math shims, unused vtable entries). See
+   `notes/datalog-baseline.md` and
+   `scripts/recovery/recover_calls.py`.
 
-5. **Phase 1 library-ID works end-to-end.** Structural matching
+6. **Phase 1 library-ID works end-to-end.** Structural matching
    between `pico_freertos_hello` and `pico_freertos_static` finds
    173 cross-target matches; 105 of those are FreeRTOS-specific.
    The pipeline answers "which functions in this binary are
    FreeRTOS?" using only SQL.
 
-6. **Byte-hash matching resolves all structural collisions.** The
+7. **Byte-hash matching resolves all structural collisions.** The
    `body_hash` column (SHA-256 of raw function bytes) achieves 100%
    disambiguation on all structural twins from the Zephyr baseline.
 
-7. **Structural fingerprinting works at ~96% cluster-level precision
+8. **Structural fingerprinting works at ~96% cluster-level precision
    under same-build conditions.** See
    `notes/fingerprinting-baseline.md`.
 
-8. **"Same toolchain" is too weak a hypothesis for cross-target
+9. **"Same toolchain" is too weak a hypothesis for cross-target
    matching.** The correct condition is matching (ISA, -O, libc,
    link surface). Validates D9 (P-Code, not disassembly).
 
-9. **Ghidra's extraction is 100% complete with respect to real
-   function bodies on both test ISAs.** See
-   `notes/ghidra-extraction-notes.md`.
+10. **Ghidra's extraction is 100% complete with respect to real
+    function bodies on both test ISAs.** See
+    `notes/ghidra-extraction-notes.md`.
 
-10. **Parquet-as-truth storage was the right call.** Adding targets
+11. **Parquet-as-truth storage was the right call.** Adding targets
     is config-only (zero code changes). See design-decisions §D15.
 
 ### Current session's recommended next move
 
 **P-Code histogram cosine similarity for cross-ISA matching.** The
-exact pcode_sequence_hash fails cross-ISA (finding #2 above), but
+exact pcode_sequence_hash fails cross-ISA (finding #3 above), but
 the opcode histogram (already in `pcode_features`) captures the
 distribution of P-Code operations without caring about order or
 register allocation. Computing cosine similarity between histograms
@@ -144,22 +154,18 @@ across the Pico/Zephyr divide is the next empirical test — it will
 either validate or kill the P-Code histogram path before investing
 in learned embeddings.
 
-After that, three parallel threads:
+After that, two parallel threads:
 
 - **Snakemake integration for Renode + Datalog.** Both tools work
   standalone; wiring them into the pipeline DAG makes them
   reproducible and cacheable. Renode depends on a `.resc` scenario
   file per (target, scenario); Datalog depends on `calls` +
-  `functions` tables.
-- **Function-pointer / computed call target recovery.** The 70%
-  unreachable gap from the Datalog baseline (finding #4) is almost
-  entirely ISR handlers and FreeRTOS task functions passed via
-  `xTaskCreate`. Recovering these edges from xrefs or constant
-  propagation would dramatically improve call-graph completeness.
-- **Agent task schema design (Phase 3 prep).** The warehouse is now
-  rich enough to support agent work. Designing the task schema
-  (`kind`, `target`, `priority`, `lease`, `status`, `payload`) is
-  the prerequisite for the Phase 3 worker loop.
+  `functions` + `recovered_calls` tables.
+- **Stock firmware recovery improvement.** The `recovered_calls`
+  pipeline currently finds 0 edges on raw binary stock firmware
+  because Ghidra's raw import misses vector table functions. Next
+  step: feed vector table addresses back to Ghidra as function
+  creation hints during import.
 
 ## Non-goals and constraints (read carefully)
 
@@ -364,6 +370,7 @@ and why. Run any of them with `scripts/query < notes/queries/<file>.sql`.
 | `reachability.sql`           | Stage 4 derivation layer in DuckDB: transitive call reachability from `main`, orchestrator detection, subsystem clustering by shared callees. See `notes/datalog-baseline.md`. |
 | `cross_isa_pcode.sql`        | Cross-ISA P-Code sequence hash matching. Tests D9 empirically: exact hash fails cross-ISA (M0+ vs M3), works within-ISA at 93-94% precision for ops >= 50. Demonstrates that histogram similarity is the path forward. |
 | `state_structure.sql`        | FNIRSI 2C53T global state structure (0x200000F8) access analysis: per-offset READ/WRITE xrefs, scope-critical preset bytes (+0xF68..+0xF6B), writer->reader data flow, USART2 peripheral access. See `notes/state_structure_analysis.md`. |
+| `recovered_calls.sql`        | Recovered call-edge analysis: per-target mechanism summary, vector table entries, reachability improvement (static-only vs static+recovered). |
 | `osc_peripheral_map.sql`     | AT32F403A peripheral register access map for stock firmware. Classifies all MMIO xrefs by peripheral block, ranks by access count, identifies multi-peripheral init/driver functions. |
 | `osc_version_diff.sql`       | Cross-version comparison across all four stock firmware versions (V1.0.3-V1.2.0). Size evolution, byte-identical functions, changed/added/removed functions, version-to-version stability matrix. |
 | `osc_scope_path.sql`         | Scope acquisition call tree: reverse call graph from FPGA-facing peripherals (USART2, SPI3, DMA, FSMC/LCD). Also identifies ADC accessor functions. |
@@ -412,6 +419,8 @@ ripcord/
 │       └── state_structure.sql      (FNIRSI state struct access: offsets, writers, readers, USART2)
 ├── scripts/
 │   ├── query                         (SQL over build/*/tables/*.parquet)
+│   ├── recovery/
+│   │   └── recover_calls.py          (standalone call recovery: vector table, binary constants, registrar dispatch)
 │   ├── datalog/
 │   │   ├── reachability.dl           (Souffle: transitive reachability + derived facts)
 │   │   └── export_facts.py           (warehouse → .facts TSV for Souffle)

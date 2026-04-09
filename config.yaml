@@ -85,6 +85,7 @@ targets:
     build_tuple: m4-keil-O2
     source: "FNIRSI manufacturer download"
     raw_binary: true
+    base_addr: 0x08004000
 
   stock_v107:
     elf: targets/stock_v107/stock_v107.bin
@@ -93,6 +94,7 @@ targets:
     build_tuple: m4-keil-O2
     source: "FNIRSI manufacturer download"
     raw_binary: true
+    base_addr: 0x08004000
 
   stock_v112:
     elf: targets/stock_v112/stock_v112.bin
@@ -101,6 +103,7 @@ targets:
     build_tuple: m4-keil-O2
     source: "FNIRSI manufacturer download"
     raw_binary: true
+    base_addr: 0x08004000
 
   stock_v120:
     elf: targets/stock_v120/stock_v120.bin
@@ -109,6 +112,7 @@ targets:
     build_tuple: m4-keil-O2
     source: "FNIRSI manufacturer download"
     raw_binary: true
+    base_addr: 0x08004000
 
   # Uncomment and add entries as you build more targets.
   #
