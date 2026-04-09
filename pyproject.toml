@@ -10,4 +10,5 @@ dependencies = [
     "snakemake",
     "pyghidra",
     "anthropic",
+    "unicorn>=2.1.4",
 ]

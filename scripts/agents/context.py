@@ -41,6 +41,9 @@ _WAREHOUSE_TABLES = [
     "strings",
     "pcode_features",
     "decompiled",
+    "peripheral_xrefs",
+    "recovered_calls",
+    "unicorn_smoke",
 ]
 
 
@@ -86,6 +89,7 @@ def assemble_propose_name_context(
     conn: duckdb.DuckDBPyConnection,
     target: str,
     function_addr: int,
+    domain_hint: str | None = None,
 ) -> dict:
     """Query the warehouse and return everything the LLM needs to name a function.
 
@@ -293,6 +297,32 @@ def assemble_propose_name_context(
     # --- (e) Neighbor context (2-hop summary) ---
     ctx["neighbor_context"] = _build_neighbor_context(conn, target, function_addr, ctx)
 
+    # --- (f) Peripheral register accesses ---
+    periph_rows = conn.execute(
+        """
+        SELECT register_name, peripheral, ref_type, peripheral_group
+        FROM peripheral_xrefs
+        WHERE source = $1 AND function_addr = $2
+        ORDER BY peripheral, register_name
+        """,
+        [target, function_addr],
+    ).fetchall()
+    ctx["peripheral_accesses"] = [
+        {
+            "register": r[0],
+            "peripheral": r[1],
+            "ref_type": r[2],
+            "group": r[3],
+        }
+        for r in periph_rows
+    ]
+
+    # --- (g) Decompiled pseudo-C ---
+    ctx["decompiled_c"] = _get_decompiled_c(conn, target, function_addr)
+
+    # --- (h) Domain hint ---
+    ctx["domain_hint"] = domain_hint
+
     return ctx
 
 
@@ -435,6 +465,14 @@ def format_propose_name_prompt(ctx: dict) -> str:
     # Provenance discipline
     sections.append(PROVENANCE_INSTRUCTIONS.strip())
 
+    # Domain hint (early — frames all subsequent interpretation)
+    if ctx.get("domain_hint"):
+        sections.append(
+            f"## Domain context\n"
+            f"This binary is from: {ctx['domain_hint']}\n"
+            f"Use domain-appropriate naming when the evidence supports it."
+        )
+
     # Target function
     lines = [
         "## Target function",
@@ -511,7 +549,25 @@ def format_propose_name_prompt(ctx: dict) -> str:
     if ctx.get("neighbor_context"):
         sections.append(f"## Neighbor context (2-hop call graph)\n{ctx['neighbor_context']}")
 
+    # Peripheral register accesses
+    if ctx.get("peripheral_accesses"):
+        lines = ["## Peripheral register accesses"]
+        for pa in ctx["peripheral_accesses"]:
+            lines.append(f"- {pa['register']} ({pa['peripheral']}, {pa['group']}): {pa['ref_type']}")
+        sections.append("\n".join(lines))
+
+    # Decompiled pseudo-C
+    if ctx.get("decompiled_c"):
+        sections.append(f"## Decompiled pseudo-C\n```c\n{ctx['decompiled_c']}\n```")
+
     # Task instruction
+    domain_note = ""
+    if ctx.get("domain_hint"):
+        domain_note = (
+            f"\nThis binary is from a {ctx['domain_hint']}. "
+            "Prefer domain-specific names when evidence supports them."
+        )
+
     sections.append(
         "## Task\n"
         "Propose a human-readable function name for the function at "
@@ -520,7 +576,7 @@ def format_propose_name_prompt(ctx: dict) -> str:
         "If the function appears to be from a known library (FreeRTOS, newlib, "
         "Pico SDK, Zephyr), use the canonical library name. "
         "If uncertain, describe what the function does "
-        "(e.g., 'uart_write_byte', 'init_timer_subsystem').\n\n"
+        f"(e.g., 'uart_write_byte', 'init_timer_subsystem').{domain_note}\n\n"
         'Respond with JSON: {"proposed_name": "...", "confidence": 0.0-1.0, '
         '"provenance": "direct-xref|decompile-derived|synthesized-model|hypothesis", '
         '"reasoning": "..."}'

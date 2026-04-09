@@ -69,6 +69,7 @@ rule all:
         expand("build/{target}/tables/xrefs.parquet",        target=TARGETS),
         expand("build/{target}/tables/strings.parquet",      target=TARGETS),
         expand("build/{target}/tables/pcode_features.parquet", target=TARGETS),
+        expand("build/{target}/tables/decompiled.parquet", target=TARGETS),
         expand("build/{target}/tables/recovered_calls.parquet", target=TARGETS),
         expand("build/{target}/tables/peripheral_xrefs.parquet", target=TARGETS),
         expand("build/{target}/tables/ground_truth_functions.parquet", target=TARGETS),
@@ -133,6 +134,36 @@ rule ghidra_extract:
         test -s {output.xrefs_jsonl}
         test -s {output.strings_jsonl}
         test -s {output.pcode_jsonl}
+        """
+
+
+rule ghidra_decompile:
+    """Run Ghidra headless to decompile all functions in the target binary.
+
+    This is a SEPARATE rule from ghidra_extract because decompilation is
+    significantly slower (~5-10 min vs ~1 min for extraction). It reuses
+    the existing Ghidra project (created by ghidra_extract) via -process
+    instead of -import.
+    """
+    input:
+        elf = lambda wc: config["targets"][wc.target]["elf"],
+        functions_jsonl = "build/{target}/functions.jsonl",
+    resources:
+        ghidra=1,
+    output:
+        decompiled_jsonl = "build/{target}/decompiled.jsonl",
+    params:
+        project_dir = lambda wc: f"build/{wc.target}/ghidra_project",
+        project_name = lambda wc: wc.target,
+        script_path = str(REPO_ROOT / "scripts" / "ghidra"),
+        decompiled_out = lambda wc: str((REPO_ROOT / f"build/{wc.target}/decompiled.jsonl").resolve()),
+    shell:
+        r"""
+        env -u VIRTUAL_ENV {GHIDRA_PYGHIDRA} -H {params.project_dir} {params.project_name} \
+            -process {params.project_name} \
+            -scriptPath {params.script_path} \
+            -postScript export_decompiler.py {params.decompiled_out}
+        test -s {output.decompiled_jsonl}
         """
 
 
@@ -226,6 +257,22 @@ rule ingest_pcode:
         r"""
         {PYTHON} scripts/ingest/load_table.py \
             --table pcode_features \
+            --source {wildcards.target} \
+            --output {output.parquet} \
+            {input.jsonl}
+        """
+
+
+rule ingest_decompiled:
+    """Load one target's decompiled pseudo-C JSONL into a typed Parquet table."""
+    input:
+        jsonl = "build/{target}/decompiled.jsonl",
+    output:
+        parquet = "build/{target}/tables/decompiled.parquet",
+    shell:
+        r"""
+        {PYTHON} scripts/ingest/load_table.py \
+            --table decompiled \
             --source {wildcards.target} \
             --output {output.parquet} \
             {input.jsonl}

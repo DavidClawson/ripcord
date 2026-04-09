@@ -28,6 +28,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     target          TEXT NOT NULL,
     entity_addr     INTEGER NOT NULL,
     priority        REAL NOT NULL DEFAULT 0,
+    round           INTEGER NOT NULL DEFAULT 0,
     status          TEXT NOT NULL DEFAULT 'pending' CHECK (status IN (
                         'pending', 'claimed', 'completed', 'failed'
                     )),
@@ -59,6 +60,7 @@ CREATE TABLE IF NOT EXISTS evidence_log (
     claim_json      TEXT NOT NULL,
     confidence      REAL NOT NULL CHECK (confidence >= 0.0 AND confidence <= 1.0),
     evidence_method TEXT NOT NULL,
+    round           INTEGER NOT NULL DEFAULT 0,
     supersedes_id   INTEGER REFERENCES evidence_log(id),
     created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
