@@ -276,6 +276,75 @@ def tool_peripheral_map(conn: duckdb.DuckDBPyConnection, args: dict) -> str:
     return result
 
 
+def tool_analyze(conn: duckdb.DuckDBPyConnection, args: dict, *, build_dir: Path) -> str:
+    """Run the full ripcord analysis pipeline on a binary."""
+    binary_path = args.get("binary_path", "")
+    chip = args.get("chip", "")
+    base_addr = args.get("base_addr", "")
+    name = args.get("name", "")
+
+    if not binary_path:
+        return "**Error:** `binary_path` is required (absolute path to firmware .bin or .elf)."
+
+    binary = Path(binary_path)
+    if not binary.exists():
+        return f"**Error:** file not found: `{binary_path}`"
+
+    # Build the ripcord.py command
+    cmd = [
+        sys.executable,
+        str(REPO_ROOT / "scripts" / "ripcord.py"),
+        str(binary),
+        "--no-open",
+    ]
+    if chip:
+        cmd.extend(["--chip", chip])
+    if base_addr:
+        cmd.extend(["--base-addr", base_addr])
+    if name:
+        cmd.extend(["--name", name])
+
+    import subprocess
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            cwd=str(REPO_ROOT),
+            timeout=600,
+        )
+    except subprocess.TimeoutExpired:
+        return "**Error:** analysis timed out after 10 minutes."
+
+    output = result.stdout
+    if result.returncode != 0:
+        return f"**Analysis failed** (exit code {result.returncode}):\n```\n{result.stderr}\n```"
+
+    # Refresh the warehouse connection so new tables are queryable
+    tables = discover_tables(build_dir)
+    new_conn = create_connection(tables)
+    # Swap the connection in the closure (caller handles this)
+    return f"**Analysis complete.**\n\n```\n{output}\n```\n\nUse `list_targets` to see the new target, then query with `function_info`, `peripheral_map`, etc."
+
+
+def tool_report(conn: duckdb.DuckDBPyConnection, args: dict) -> str:
+    """Generate an HTML report for a target."""
+    target = args.get("target", "")
+    if not target:
+        return "**Error:** `target` parameter is required."
+
+    import subprocess
+    output_path = REPO_ROOT / "build" / target / "report.html"
+    result = subprocess.run(
+        [sys.executable, str(REPO_ROOT / "scripts" / "render" / "report.py"),
+         target, "--output", str(output_path)],
+        capture_output=True, text=True, cwd=str(REPO_ROOT),
+    )
+    if result.returncode != 0:
+        return f"**Report generation failed:**\n```\n{result.stderr}\n```"
+    return f"**Report generated:** `{output_path}`\n\n{result.stdout}"
+
+
 def tool_find_functions(conn: duckdb.DuckDBPyConnection, args: dict) -> str:
     target = args.get("target", "")
     if not target:
@@ -309,6 +378,15 @@ def _tool(name, desc, props, required=None):
     return Tool(name=name, description=desc, inputSchema=schema)
 
 TOOLS = [
+    _tool("analyze",
+          "Run the full ripcord analysis pipeline on a firmware binary. Extracts functions, "
+          "calls, peripherals, and more. Takes a few minutes for Ghidra analysis. "
+          "After completion, use list_targets/function_info/peripheral_map to explore results.",
+          {"binary_path": {"type": "string", "description": "Absolute path to firmware .bin or .elf"},
+           "chip": {"type": "string", "description": "Chip family (e.g. 'AT32F403A', 'RP2040'). Enables SVD peripheral resolution."},
+           "base_addr": {"type": "string", "description": "Load address for raw binaries (e.g. '0x08004000'). Auto-detected if omitted."},
+           "name": {"type": "string", "description": "Target name (default: derived from filename)"}},
+          ["binary_path"]),
     _tool("query",
           "Run DuckDB SQL against the ripcord warehouse. Views: functions, calls, "
           "basic_blocks, xrefs, strings, pcode_features, recovered_calls, mmio_events, "
@@ -335,6 +413,10 @@ TOOLS = [
            "min_size": {"type": "integer", "description": "Minimum size in bytes"},
            "name_pattern": {"type": "string", "description": "Name pattern (case-insensitive)"}},
           ["target"]),
+    _tool("report",
+          "Generate a self-contained HTML report for an analyzed target. Returns the file path.",
+          {"target": {"type": "string", "description": "Target name"}},
+          ["target"]),
 ]
 
 DISPATCH = {t.name: globals()[f"tool_{t.name}"] for t in TOOLS}
@@ -345,10 +427,16 @@ def build_server(build_dir: Path) -> Server:
     if not tables:
         print(
             f"warning: no parquet tables found under {build_dir}/*/tables/ — "
-            "run `snakemake --cores 4` to populate the warehouse",
+            "use the 'analyze' tool to process a firmware binary",
             file=sys.stderr,
         )
-    conn = create_connection(tables)
+    # Mutable container so analyze can refresh the connection
+    state = {"conn": create_connection(tables), "build_dir": build_dir}
+
+    def refresh_conn():
+        """Re-discover tables and recreate the DuckDB connection."""
+        new_tables = discover_tables(state["build_dir"])
+        state["conn"] = create_connection(new_tables)
 
     server = Server("ripcord")
 
@@ -362,7 +450,11 @@ def build_server(build_dir: Path) -> Server:
         if not handler:
             return [TextContent(type="text", text=f"Unknown tool: {name}")]
         try:
-            result = handler(conn, arguments)
+            if name == "analyze":
+                result = handler(state["conn"], arguments, build_dir=state["build_dir"])
+                refresh_conn()  # pick up new parquet files
+            else:
+                result = handler(state["conn"], arguments)
         except Exception:
             result = f"**Internal error:**\n```\n{traceback.format_exc()}\n```"
         return [TextContent(type="text", text=result)]
