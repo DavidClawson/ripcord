@@ -120,6 +120,7 @@ rule ghidra_extract:
             -import {input.elf} \
             -overwrite \
             -scriptPath {params.script_path} \
+            -postScript create_vector_functions.py \
             -postScript export_functions.py     {params.functions_out} \
             -postScript export_calls.py         {params.calls_out} \
             -postScript export_basic_blocks.py  {params.basic_blocks_out} \

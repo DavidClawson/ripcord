@@ -32,6 +32,7 @@ class RegisterInfo:
     group: str
     base_addr: int  # peripheral base address
     reg_addr: int  # absolute register address (0 if no exact match)
+    alias: str = ""  # "", "xor", "set", "clr" — RP2040 atomic register aliases
 
 
 @dataclass
@@ -229,6 +230,20 @@ _CORTEX_M_SYSTEM: list[PeripheralDef] = [
 
 
 # ---------------------------------------------------------------------------
+# RP2040 atomic register aliases
+# ---------------------------------------------------------------------------
+
+# The RP2040 maps every peripheral register at three additional offsets
+# for atomic XOR/SET/CLR access.  The alias offset is always relative to
+# the peripheral's base address (not the individual register).
+_ALIAS_OFFSETS: dict[int, str] = {
+    0x1000: "xor",
+    0x2000: "set",
+    0x3000: "clr",
+}
+
+
+# ---------------------------------------------------------------------------
 # SVD parser
 # ---------------------------------------------------------------------------
 
@@ -239,7 +254,14 @@ class RegisterMap:
     Uses sorted peripheral ranges for fast lookup.
     """
 
-    def __init__(self, peripherals: list[PeripheralDef]):
+    def __init__(
+        self,
+        peripherals: list[PeripheralDef],
+        *,
+        atomic_aliases: bool = False,
+    ):
+        self._atomic_aliases = atomic_aliases
+
         # Build sorted list of (base_addr, end_addr, PeripheralDef)
         self._ranges: list[tuple[int, int, PeripheralDef]] = []
         for p in peripherals:
@@ -254,12 +276,8 @@ class RegisterMap:
                 addr = p.base_addr + offset
                 self._exact[addr] = (p, reg_name)
 
-    def lookup(self, addr: int) -> RegisterInfo | None:
-        """Look up a peripheral register by absolute address.
-
-        Returns RegisterInfo if the address falls within any peripheral's
-        address block, or None if it's not a peripheral address.
-        """
+    def _lookup_base(self, addr: int) -> RegisterInfo | None:
+        """Core lookup against base addresses only (no alias resolution)."""
         # Fast path: exact register match
         if addr in self._exact:
             p, reg_name = self._exact[addr]
@@ -291,20 +309,69 @@ class RegisterMap:
                 )
         return None
 
+    def lookup(self, addr: int) -> RegisterInfo | None:
+        """Look up a peripheral register by absolute address.
+
+        Returns RegisterInfo if the address falls within any peripheral's
+        address block, or None if it's not a peripheral address.
+
+        When atomic_aliases is enabled (RP2040), addresses at +0x1000/
+        +0x2000/+0x3000 from a known peripheral base are resolved back
+        to the base peripheral with the alias field set.
+        """
+        result = self._lookup_base(addr)
+        if result is not None:
+            return result
+
+        if not self._atomic_aliases:
+            return None
+
+        # Try each alias offset: subtract it and see if the base address resolves
+        for offset, alias_name in _ALIAS_OFFSETS.items():
+            base_addr = addr - offset
+            if base_addr < 0:
+                continue
+            base_result = self._lookup_base(base_addr)
+            if base_result is not None:
+                return RegisterInfo(
+                    peripheral=base_result.peripheral,
+                    register=base_result.register,
+                    group=base_result.group,
+                    base_addr=base_result.base_addr,
+                    reg_addr=base_addr + (addr - base_addr),  # original alias addr
+                    alias=alias_name,
+                )
+
+        return None
+
     @property
     def peripherals(self) -> list[PeripheralDef]:
         return [r[2] for r in self._ranges]
 
 
-def parse_svd(path: str | Path) -> RegisterMap:
+def _detect_rp2040(root: ET.Element) -> bool:
+    """Return True if the SVD describes an RP2040 (has atomic register aliases)."""
+    device_name = (root.findtext("name") or "").upper()
+    vendor = (root.findtext("vendor") or "").lower()
+    return "RP2040" in device_name or "raspberry pi" in vendor
+
+
+def parse_svd(path: str | Path, *, atomic_aliases: bool | None = None) -> RegisterMap:
     """Parse a CMSIS-SVD file and return a RegisterMap.
 
     Includes Cortex-M system peripherals (SysTick, NVIC, SCB, FPU, MPU)
     automatically — these are at fixed addresses on all Cortex-M parts.
+
+    atomic_aliases: if True, enable RP2040-style atomic XOR/SET/CLR
+    alias resolution at +0x1000/+0x2000/+0x3000 from each peripheral
+    base. If None (default), auto-detect from the SVD device name.
     """
     path = Path(path)
     tree = ET.parse(path)
     root = tree.getroot()
+
+    if atomic_aliases is None:
+        atomic_aliases = _detect_rp2040(root)
 
     # First pass: collect all peripherals, resolving derivedFrom
     peripheral_defs: dict[str, PeripheralDef] = {}
@@ -327,7 +394,7 @@ def parse_svd(path: str | Path) -> RegisterMap:
 
     # Combine with Cortex-M system peripherals
     all_peripherals = list(peripheral_defs.values()) + list(_CORTEX_M_SYSTEM)
-    return RegisterMap(all_peripherals)
+    return RegisterMap(all_peripherals, atomic_aliases=atomic_aliases)
 
 
 def cortex_m_system_map() -> RegisterMap:
@@ -412,6 +479,7 @@ if __name__ == "__main__":
         addr = int(sys.argv[2], 0)
         info = reg_map.lookup(addr)
         if info:
-            print(f"\n0x{addr:08X} -> {info.peripheral}.{info.register} [{info.group}]")
+            alias_suffix = f" ({info.alias.upper()} alias)" if info.alias else ""
+            print(f"\n0x{addr:08X} -> {info.peripheral}.{info.register} [{info.group}]{alias_suffix}")
         else:
             print(f"\n0x{addr:08X} -> (not a peripheral address)")

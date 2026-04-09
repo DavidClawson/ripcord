@@ -116,6 +116,11 @@ def classify_target(target: str, target_cfg: dict) -> int:
             if info:
                 peripheral = info.peripheral
                 register_name = info.register
+                # Append alias suffix for RP2040 atomic aliases
+                if info.alias and register_name:
+                    register_name = f"{register_name}[{info.alias.upper()}]"
+                elif info.alias:
+                    register_name = f"[{info.alias.upper()}]"
                 group = info.group
             elif has_svd:
                 # Address is in peripheral range but not in any SVD peripheral
