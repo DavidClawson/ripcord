@@ -1,0 +1,13 @@
+[project]
+name = "ripcord"
+version = "0.1.0"
+description = "Firmware reverse-engineering pipeline"
+requires-python = ">=3.11"
+dependencies = [
+    "duckdb>=0.10",
+    "pyarrow",
+    "polars",
+    "snakemake",
+    "pyghidra",
+    "anthropic",
+]

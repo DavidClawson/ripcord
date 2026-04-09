@@ -37,16 +37,22 @@ companion `pyghidra` Python package into the same venv the rest of
 the pipeline uses. It brings `jpype1` along as a dependency, which
 is what bridges Python to Ghidra's JVM. See the Python section below.
 
-### Python 3.11+
+### Python 3.11+ (via uv)
 
-A single virtualenv is used for Snakemake, DuckDB/Polars ingest, and
-PyGhidra:
+Dependencies are declared in `pyproject.toml`. Install
+[uv](https://docs.astral.sh/uv/) and sync:
 
 ```bash
-python3 -m venv ~/.venvs/ripcord
-source ~/.venvs/ripcord/bin/activate
-pip install 'duckdb>=0.10' pyarrow polars snakemake pyghidra
+# Install uv if you don't have it
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# From the repo root — creates .venv/ and installs all deps
+uv sync
 ```
+
+All pipeline scripts (`scripts/query`, Snakemake ingest rules) use
+`uv run` to pick up the project venv automatically. No manual
+activation needed.
 
 `pyghidra` pulls in `jpype1`, which builds a native extension against
 your Python version. On Python 3.14 there are no prebuilt wheels yet,
