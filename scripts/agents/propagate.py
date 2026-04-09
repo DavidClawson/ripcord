@@ -43,6 +43,7 @@ from context import (
     register_warehouse,
 )
 from peripheral_affinity import compute_transitive_affinity
+from data_flow import compute_shared_globals
 from worker import (
     call_claude,
     claim_next_task,
@@ -423,6 +424,7 @@ def run_round_worker(
     dry_run: bool,
     concurrency: int = 5,
     peripheral_affinities: dict | None = None,
+    shared_globals: dict | None = None,
 ) -> dict:
     """Process all pending tasks for this round with parallel API calls.
 
@@ -447,6 +449,7 @@ def run_round_worker(
                 domain_hint=domain_hint,
                 conn_sqlite=conn_sqlite,
                 peripheral_affinities=peripheral_affinities,
+                shared_globals=shared_globals,
             )
             prompt = format_propose_name_prompt(ctx)
             work_items.append((task, prompt))
@@ -712,6 +715,192 @@ def _confidence_distribution(conn_sqlite: sqlite3.Connection, target: str) -> st
 # Main propagation loop
 # ---------------------------------------------------------------------------
 
+def run_revisit_pass(
+    conn_sqlite: sqlite3.Connection,
+    conn_duckdb: duckdb.DuckDBPyConnection,
+    target: str,
+    model: str,
+    agent_id: str,
+    domain_hint: str | None,
+    dry_run: bool,
+    concurrency: int,
+    confidence_threshold: float,
+    peripheral_affinities: dict | None,
+    shared_globals: dict | None,
+    revisit_round: int,
+    db_path: str,
+    max_revisit: int = 50,
+) -> dict:
+    """Re-analyze functions whose best confidence is below threshold.
+
+    These functions were analyzed early when context was sparse.
+    Now that their neighbors are named and modules are assigned,
+    re-analysis with richer context often improves accuracy.
+
+    Only re-analyzes functions that now have MORE named neighbors
+    than when they were first analyzed (otherwise re-analysis
+    won't help).
+
+    Returns dict with: candidates, context_gained, tasks_completed,
+    input_tokens, output_tokens, cost_usd, upgrades.
+    """
+    # --- Find functions with best confidence below threshold ---
+    rows = conn_sqlite.execute("""
+        SELECT entity_addr, MAX(confidence) AS best_conf, MIN(round) AS first_round,
+               id AS best_id
+        FROM evidence_log
+        WHERE target = ? AND claim_type = 'name'
+        GROUP BY entity_addr
+        HAVING MAX(confidence) < ?
+    """, (target, confidence_threshold)).fetchall()
+
+    if not rows:
+        print(f"  no functions below threshold {confidence_threshold}")
+        return {"candidates": 0, "context_gained": 0, "tasks_completed": 0,
+                "input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0,
+                "upgrades": 0}
+
+    print(f"  {len(rows)} functions below confidence {confidence_threshold}")
+
+    # --- For each candidate, check if it gained named neighbors ---
+    # Get the best evidence ID per entity (for supersedes_id linkage)
+    best_evidence = {}
+    for row in rows:
+        entity_addr, best_conf, first_round, eid = row
+        best_evidence[entity_addr] = {"conf": best_conf, "first_round": first_round, "id": eid}
+
+    # Get all currently named functions (conf >= 0.50)
+    all_named = set()
+    named_rows = conn_sqlite.execute("""
+        SELECT DISTINCT entity_addr FROM evidence_log
+        WHERE target = ? AND claim_type = 'name' AND confidence >= 0.50
+    """, (target,)).fetchall()
+    for r in named_rows:
+        all_named.add(r[0])
+
+    # For each candidate, count named neighbors now vs at first_round
+    context_gained_addrs = []
+    for entity_addr, info in best_evidence.items():
+        first_round = info["first_round"]
+
+        # Get call-graph neighbors via DuckDB
+        neighbors = set()
+        for q, params in [
+            ("SELECT DISTINCT caller_addr FROM calls WHERE source = $1 AND callee_addr = $2",
+             [target, entity_addr]),
+            ("SELECT DISTINCT callee_addr FROM calls WHERE source = $1 AND caller_addr = $2",
+             [target, entity_addr]),
+        ]:
+            neighbor_rows = conn_duckdb.execute(q, params).fetchall()
+            neighbors.update(r[0] for r in neighbor_rows)
+
+        # Named neighbors NOW
+        named_now = len(neighbors & all_named)
+
+        # Named neighbors at the time of first analysis
+        # (functions named in rounds strictly before first_round)
+        named_before = set()
+        if first_round > 0:
+            before_rows = conn_sqlite.execute("""
+                SELECT DISTINCT entity_addr FROM evidence_log
+                WHERE target = ? AND claim_type = 'name'
+                  AND confidence >= 0.50 AND round < ?
+            """, (target, first_round)).fetchall()
+            named_before = {r[0] for r in before_rows}
+        named_then = len(neighbors & named_before)
+
+        new_named_neighbors = named_now - named_then
+        if new_named_neighbors >= 2:
+            context_gained_addrs.append((entity_addr, new_named_neighbors, info))
+
+    print(f"  {len(context_gained_addrs)} gained >= 2 new named neighbors")
+
+    if not context_gained_addrs:
+        return {"candidates": len(rows), "context_gained": 0, "tasks_completed": 0,
+                "input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0,
+                "upgrades": 0}
+
+    # Sort by context gain descending, cap at max_revisit
+    context_gained_addrs.sort(key=lambda x: x[1], reverse=True)
+    context_gained_addrs = context_gained_addrs[:max_revisit]
+
+    print(f"  revisiting {len(context_gained_addrs)} functions (capped at {max_revisit})")
+
+    # --- Ensure evidence is promoted so context assembly sees latest names ---
+    promote_evidence(conn_sqlite, conn_duckdb, target, db_path)
+
+    # --- Generate tasks for revisit round ---
+    # Clear any existing revisit-round tasks
+    conn_sqlite.execute(
+        "DELETE FROM tasks WHERE kind = 'propose_name' AND target = ? "
+        "AND status = 'pending' AND round = ?",
+        (target, revisit_round),
+    )
+
+    for entity_addr, gain, info in context_gained_addrs:
+        # Get function metadata from DuckDB
+        fn_row = conn_duckdb.execute("""
+            SELECT name, size, basic_block_count FROM functions
+            WHERE source = $1 AND addr = $2
+        """, [target, entity_addr]).fetchone()
+        if fn_row is None:
+            continue
+
+        name, size, bb_count = fn_row
+        payload = {
+            "addr": entity_addr,
+            "current_name": name,
+            "size": size,
+            "basic_block_count": bb_count,
+            "round": revisit_round,
+            "revisit": True,
+            "prior_confidence": info["conf"],
+            "context_gain": gain,
+        }
+        conn_sqlite.execute(
+            """INSERT INTO tasks
+               (kind, target, entity_addr, priority, round, status, payload_json)
+               VALUES (?, ?, ?, ?, ?, 'pending', ?)""",
+            ("propose_name", target, entity_addr, 1.0, revisit_round,
+             json.dumps(payload)),
+        )
+    conn_sqlite.commit()
+
+    # --- Run through the standard worker pipeline ---
+    result = run_round_worker(
+        conn_sqlite, conn_duckdb, target, revisit_round,
+        model, agent_id, domain_hint, dry_run, concurrency,
+        peripheral_affinities=peripheral_affinities,
+        shared_globals=shared_globals,
+    )
+
+    # --- Post-process: link supersedes_id and only keep upgrades ---
+    upgrades = 0
+    if not dry_run:
+        # For each revisit evidence entry, check if it beat the old one
+        revisit_evidence = conn_sqlite.execute("""
+            SELECT id, entity_addr, confidence FROM evidence_log
+            WHERE target = ? AND round = ? AND claim_type = 'name'
+        """, (target, revisit_round)).fetchall()
+
+        for eid, entity_addr, new_conf in revisit_evidence:
+            if entity_addr in best_evidence:
+                old_info = best_evidence[entity_addr]
+                # Always set supersedes_id for traceability
+                conn_sqlite.execute(
+                    "UPDATE evidence_log SET supersedes_id = ? WHERE id = ?",
+                    (old_info["id"], eid),
+                )
+                if new_conf > old_info["conf"]:
+                    upgrades += 1
+        conn_sqlite.commit()
+
+    result["candidates"] = len(rows)
+    result["context_gained"] = len(context_gained_addrs)
+    result["upgrades"] = upgrades
+    return result
+
+
 def run_propagation(
     target: str,
     build_dir: str,
@@ -724,6 +913,7 @@ def run_propagation(
     concurrency: int = 5,
     binary_path: str | None = None,
     base_addr: int = 0x08000000,
+    revisit_threshold: float = 0.75,
 ) -> None:
     """Main propagation loop: multiple rounds of agent analysis."""
     build_path = Path(build_dir)
@@ -789,6 +979,15 @@ def run_propagation(
         print(f"propagate: peripheral affinity failed ({exc}), continuing without")
         peripheral_affinities = None
 
+    # Compute shared globals once (shared across all rounds)
+    print("propagate: computing shared globals for data flow...")
+    try:
+        shared_globals = compute_shared_globals(conn_duckdb, target)
+        print(f"propagate: {len(shared_globals)} shared global addresses")
+    except Exception as exc:
+        print(f"propagate: shared globals failed ({exc}), continuing without")
+        shared_globals = None
+
     agent_id = f"propagate-{uuid4().hex[:8]}"
     cumulative_cost = 0.0
     cumulative_tokens_in = 0
@@ -835,6 +1034,7 @@ def run_propagation(
             conn_sqlite, conn_duckdb, target, round_num,
             model, agent_id, domain_hint, dry_run, concurrency,
             peripheral_affinities=peripheral_affinities,
+            shared_globals=shared_globals,
         )
 
         cumulative_cost += result["cost_usd"]
@@ -896,6 +1096,39 @@ def run_propagation(
     print(f"  total cost: ${cumulative_cost:.4f}")
     print(f"  confidence distribution:")
     print(_confidence_distribution(conn_sqlite, target))
+
+    # --- Revisit pass: re-analyze low-confidence functions with richer context ---
+    if revisit_threshold > 0:
+        print(f"\n{'='*60}")
+        print(f"  REVISIT PASS (threshold={revisit_threshold})")
+        print(f"{'='*60}")
+        revisit_round = max_rounds + 1  # Distinct round number
+        revisit_result = run_revisit_pass(
+            conn_sqlite=conn_sqlite,
+            conn_duckdb=conn_duckdb,
+            target=target,
+            model=model,
+            agent_id=agent_id,
+            domain_hint=domain_hint,
+            dry_run=dry_run,
+            concurrency=concurrency,
+            confidence_threshold=revisit_threshold,
+            peripheral_affinities=peripheral_affinities,
+            shared_globals=shared_globals,
+            revisit_round=revisit_round,
+            db_path=db_path,
+        )
+        print(f"  candidates below threshold: {revisit_result['candidates']}")
+        print(f"  gained context (revisited): {revisit_result['context_gained']}")
+        print(f"  tasks completed: {revisit_result['tasks_completed']}")
+        if not dry_run:
+            print(f"  confidence upgrades: {revisit_result['upgrades']}")
+            print(f"  revisit cost: ${revisit_result['cost_usd']:.4f}")
+            cumulative_cost += revisit_result["cost_usd"]
+            cumulative_tokens_in += revisit_result["input_tokens"]
+            cumulative_tokens_out += revisit_result["output_tokens"]
+        print(f"  confidence distribution (post-revisit):")
+        print(_confidence_distribution(conn_sqlite, target))
 
     # Log the agent run
     if not dry_run:
@@ -961,6 +1194,11 @@ def main():
         help="Binary load address for smoke test (default: 0x08000000)",
     )
     parser.add_argument(
+        "--revisit-threshold", type=float, default=0.75,
+        help="After propagation, re-analyze functions below this confidence "
+             "(default: 0.75, 0 to disable)",
+    )
+    parser.add_argument(
         "--dry-run", action="store_true",
         help="Generate tasks and print prompts without calling the API",
     )
@@ -978,6 +1216,7 @@ def main():
         concurrency=args.concurrency,
         binary_path=args.binary,
         base_addr=args.base_addr,
+        revisit_threshold=args.revisit_threshold,
     )
 
 

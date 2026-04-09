@@ -82,6 +82,8 @@ def build_phase_prompt(
     decompiled_lines: list[str] | None,
     domain_hint: str | None,
     total_phases: int,
+    prev_phase: dict | None = None,
+    next_phase: dict | None = None,
 ) -> str:
     """Build an LLM prompt for analyzing a single phase of a large function."""
     sections = []
@@ -107,6 +109,26 @@ def build_phase_prompt(
         f"Total size: {function_size} bytes\n"
         f"This is phase {phase['phase']} of {total_phases} phases."
     )
+
+    # Sequence context (neighboring phases)
+    if prev_phase or next_phase:
+        seq_lines = ["## Sequence context"]
+        if prev_phase:
+            prev_periphs = ", ".join(sorted(prev_phase.get("peripherals", {}).keys()))
+            seq_lines.append(
+                f"Previous phase (Phase {prev_phase['phase']}): {prev_phase['label']}"
+                + (f" — peripherals: {prev_periphs}" if prev_periphs else "")
+            )
+        seq_lines.append(
+            f"**Current phase (Phase {phase['phase']}): {phase['label']}**"
+        )
+        if next_phase:
+            next_periphs = ", ".join(sorted(next_phase.get("peripherals", {}).keys()))
+            seq_lines.append(
+                f"Next phase (Phase {next_phase['phase']}): {next_phase['label']}"
+                + (f" — peripherals: {next_periphs}" if next_periphs else "")
+            )
+        sections.append("\n".join(seq_lines))
 
     # Phase details
     start = f"0x{phase['start_addr']:08x}"
@@ -322,10 +344,16 @@ def run_phase_analysis(
         total_phases = result["total_phases"]
         print(f"    {total_phases} phases found")
 
-        for phase in result["phases"]:
+        all_phases = result["phases"]
+        for phase in all_phases:
             # Skip tiny phases (< 5 peripheral accesses)
             if phase["access_count"] < 5:
                 continue
+
+            # Look up prev/next from the full phase list (not filtered)
+            phase_idx = phase["phase"] - 1  # phases are 1-indexed
+            prev_phase = all_phases[phase_idx - 1] if phase_idx > 0 else None
+            next_phase = all_phases[phase_idx + 1] if phase_idx + 1 < len(all_phases) else None
 
             prompt = build_phase_prompt(
                 function_name=name,
@@ -335,6 +363,8 @@ def run_phase_analysis(
                 decompiled_lines=decompiled_cache.get(addr),
                 domain_hint=domain_hint,
                 total_phases=total_phases,
+                prev_phase=prev_phase,
+                next_phase=next_phase,
             )
 
             all_tasks.append({

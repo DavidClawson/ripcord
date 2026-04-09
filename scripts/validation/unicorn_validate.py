@@ -113,6 +113,84 @@ def _has_thumb_prologue(data: bytes, offset: int) -> str | None:
 
 
 # ---------------------------------------------------------------------------
+# Veneer / trampoline detection (static, no emulation)
+# ---------------------------------------------------------------------------
+
+def _detect_veneer(data: bytes, offset: int, size: int, base_addr: int) -> int | None:
+    """Check if function bytes are a veneer (single branch to another address).
+
+    Returns the branch target address, or None if not a veneer.
+    Only detects functions <= 12 bytes that are a single unconditional branch.
+    """
+    if size > 12 or offset + 2 > len(data):
+        return None
+
+    hw = int.from_bytes(data[offset:offset + 2], 'little')
+
+    # --- B (Thumb narrow unconditional): 1110 0 imm11 ---
+    # Encoding: 0xE000 | imm11.  imm11 is signed, target = PC+4 + imm11*2
+    if hw >> 11 == 0b11100:
+        imm11 = hw & 0x7FF
+        # sign extend 11 bits
+        if imm11 & 0x400:
+            imm11 -= 0x800
+        pc = base_addr + offset
+        target = (pc + 4) + imm11 * 2
+        target &= 0xFFFFFFFF
+        if FLASH_BASE <= target < FLASH_BASE + FLASH_SIZE:
+            return target
+        return None
+
+    # --- Thumb2 instructions: need second halfword ---
+    if offset + 4 > len(data):
+        return None
+    hw2 = int.from_bytes(data[offset + 2:offset + 4], 'little')
+
+    # --- B.W (Thumb2 unconditional branch, encoding T4) ---
+    # First halfword:  1111 0 S imm10
+    # Second halfword: 10 J1 1 J2 imm11
+    if (hw & 0xF800) == 0xF000 and (hw2 & 0xD000) == 0x9000:
+        S = (hw >> 10) & 1
+        imm10 = hw & 0x3FF
+        J1 = (hw2 >> 13) & 1
+        J2 = (hw2 >> 11) & 1
+        imm11 = hw2 & 0x7FF
+        # I1 = NOT(J1 XOR S), I2 = NOT(J2 XOR S)
+        I1 = (~(J1 ^ S)) & 1
+        I2 = (~(J2 ^ S)) & 1
+        imm32 = (S << 24) | (I1 << 23) | (I2 << 22) | (imm10 << 12) | (imm11 << 1)
+        # sign extend from 25 bits
+        if imm32 & (1 << 24):
+            imm32 -= (1 << 25)
+        pc = base_addr + offset
+        target = (pc + 4 + imm32) & 0xFFFFFFFF
+        if FLASH_BASE <= target < FLASH_BASE + FLASH_SIZE:
+            return target
+        return None
+
+    # --- LDR PC, [PC, #imm12]: 0xF8DF + imm12 ---
+    # Encoding: hw=0xF8DF, hw2[15:12]=0xF (Rt=PC), imm12=hw2[11:0]
+    if hw == 0xF8DF and (hw2 & 0xF000) == 0xF000:
+        imm12 = hw2 & 0xFFF
+        pc = base_addr + offset
+        # Align(PC,4) + 4 + imm12
+        load_addr = ((pc & ~3) + 4 + imm12)
+        load_offset = load_addr - base_addr
+        if load_offset + 4 > len(data) or load_offset < 0:
+            return None
+        target = int.from_bytes(data[load_offset:load_offset + 4], 'little')
+        # Clear Thumb bit for address comparison
+        target_addr = target & ~1
+        if FLASH_BASE <= target_addr < FLASH_BASE + FLASH_SIZE:
+            return target_addr
+        return None
+
+    # BX Rm: can't resolve target statically — skip
+
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Trace record
 # ---------------------------------------------------------------------------
 
@@ -151,7 +229,8 @@ class SmokeResult:
     periph_write_count: int
     periph_read_count: int
     periph_addrs: list[int]   # unique peripheral addresses touched
-    classification: str       # 'code', 'data', 'uncertain'
+    classification: str       # 'code', 'data', 'uncertain', 'veneer'
+    veneer_target: int | None  # branch target if function is a veneer
 
 
 # ---------------------------------------------------------------------------
@@ -291,6 +370,7 @@ _SMOKE_SCHEMA = pa.schema([
     ("executable", pa.bool_()),
     ("error", pa.string()),
     ("classification", pa.string()),
+    ("veneer_target", pa.int64()),
     ("periph_write_count", pa.int64()),
     ("periph_read_count", pa.int64()),
     ("extracted_at", pa.timestamp("us", tz="UTC")),
@@ -341,6 +421,7 @@ def run_smoke_test(
     code_count = 0
     data_count = 0
     uncertain_count = 0
+    veneer_count = 0
 
     t0 = time.monotonic()
     for addr, name, size in rows:
@@ -349,6 +430,29 @@ def run_smoke_test(
 
         # Static check: does it look like Thumb code?
         prologue = _has_thumb_prologue(binary_data, offset)
+
+        # Check for veneer first (before emulation — saves time)
+        veneer_target = _detect_veneer(binary_data, offset, size, base_addr)
+        if veneer_target is not None:
+            classification = "veneer"
+            executable = True
+            veneer_count += 1
+            results.append(SmokeResult(
+                addr=addr,
+                name=name,
+                size=size,
+                has_prologue=prologue is not None,
+                prologue_type=prologue,
+                instructions_executed=1,
+                executable=executable,
+                error=None,
+                periph_write_count=0,
+                periph_read_count=0,
+                periph_addrs=[],
+                classification=classification,
+                veneer_target=veneer_target,
+            ))
+            continue
 
         # Dynamic check: try to execute
         smoke = emu.smoke_test(addr, max_insns=20)
@@ -396,6 +500,7 @@ def run_smoke_test(
             periph_read_count=smoke["periph_reads"],
             periph_addrs=smoke["periph_addrs"],
             classification=classification,
+            veneer_target=None,
         ))
 
     elapsed = time.monotonic() - t0
@@ -406,9 +511,17 @@ def run_smoke_test(
     print(f"{'='*60}")
     print(f"  total functions:  {len(results)}")
     print(f"  CODE:             {code_count}")
+    print(f"  VENEER:           {veneer_count}")
     print(f"  DATA:             {data_count}")
     print(f"  UNCERTAIN:        {uncertain_count}")
     print(f"  time:             {elapsed:.1f}s ({elapsed/len(results)*1000:.0f}ms/fn)")
+
+    # Show veneer functions
+    if veneer_count > 0:
+        print(f"\n  Functions classified as VENEER ({veneer_count}):")
+        for r in results:
+            if r.classification == "veneer":
+                print(f"    0x{r.addr:08x}  {r.size:5d}B  {r.name}  -> 0x{r.veneer_target:08x}")
 
     # Show data-classified functions
     if data_count > 0:
@@ -442,6 +555,7 @@ def run_smoke_test(
         "executable": [r.executable for r in results],
         "error": [r.error for r in results],
         "classification": [r.classification for r in results],
+        "veneer_target": [r.veneer_target for r in results],
         "periph_write_count": [r.periph_write_count for r in results],
         "periph_read_count": [r.periph_read_count for r in results],
         "extracted_at": [now] * len(results),

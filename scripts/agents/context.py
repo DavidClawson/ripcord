@@ -35,6 +35,8 @@ if _AGENTS_DIR not in sys.path:
 
 from register_map import decode_register, annotate_decompiled_c, REGISTER_NAMES
 from peripheral_affinity import compute_transitive_affinity, format_affinity_context
+from data_flow import compute_shared_globals, get_data_flow_context, format_data_flow_context
+from known_constants import scan_decompiled_c, format_constants_context
 
 
 # ---------------------------------------------------------------------------
@@ -155,6 +157,45 @@ def _batch_module_lookup(
     return result
 
 
+def _get_neighbor_rationales(
+    conn_sqlite: sqlite3.Connection | None,
+    target: str,
+    addrs: list[int],
+) -> dict[int, str]:
+    """Get the best evidence rationale for each neighbor address.
+
+    Returns: {addr: "one-line rationale"} for neighbors that have evidence.
+    """
+    if conn_sqlite is None or not addrs:
+        return {}
+    try:
+        placeholders = ",".join("?" for _ in addrs)
+        rows = conn_sqlite.execute(
+            f"""
+            SELECT entity_addr,
+                   json_extract(claim_json, '$.rationale') AS rationale,
+                   confidence
+            FROM evidence_log
+            WHERE target = ? AND claim_type = 'name'
+                  AND entity_addr IN ({placeholders})
+                  AND confidence >= 0.50
+            ORDER BY confidence DESC
+            """,
+            [target] + addrs,
+        ).fetchall()
+        result: dict[int, str] = {}
+        for addr, rationale, conf in rows:
+            if addr not in result and rationale:
+                # Truncate and clean
+                r = rationale.strip().strip('"')
+                if len(r) > 100:
+                    r = r[:97] + "..."
+                result[addr] = r
+        return result
+    except Exception:
+        return {}
+
+
 def assemble_propose_name_context(
     conn: duckdb.DuckDBPyConnection,
     target: str,
@@ -162,6 +203,7 @@ def assemble_propose_name_context(
     domain_hint: str | None = None,
     conn_sqlite: sqlite3.Connection | None = None,
     peripheral_affinities: dict[int, dict[str, float]] | None = None,
+    shared_globals: dict[int, dict] | None = None,
 ) -> dict:
     """Query the warehouse and return everything the LLM needs to name a function.
 
@@ -404,13 +446,32 @@ def assemble_propose_name_context(
     # to avoid recomputing the full graph per function.
     ctx["peripheral_affinity"] = peripheral_affinities.get(function_addr, {}) if peripheral_affinities else {}
 
-    # --- (h) Decompiled pseudo-C ---
+    # --- (h) Cross-function data flow via shared globals ---
+    if shared_globals:
+        ctx["data_flow"] = get_data_flow_context(shared_globals, function_addr)
+    else:
+        ctx["data_flow"] = {"writes_to": [], "reads_from": []}
+
+    # --- (i) Decompiled pseudo-C ---
     ctx["decompiled_c"] = _get_decompiled_c(conn, target, function_addr)
 
-    # --- (i) Domain hint ---
+    # --- (j) Known constants in decompiled C ---
+    if ctx["decompiled_c"]:
+        ctx["known_constants"] = scan_decompiled_c(ctx["decompiled_c"])
+    else:
+        ctx["known_constants"] = []
+
+    # --- (k) Evidence rationale from prior rounds ---
+    ctx["caller_rationales"] = _get_neighbor_rationales(
+        conn_sqlite, target,
+        [int(c["addr"], 16) for c in ctx.get("callers", [])]
+        + [int(c["addr"], 16) for c in ctx.get("callees", [])],
+    )
+
+    # --- (l) Domain hint ---
     ctx["domain_hint"] = domain_hint
 
-    # --- (j) Module membership ---
+    # --- (m) Module membership ---
     ctx["module_info"] = _get_module_info(conn_sqlite, target, function_addr)
 
     return ctx
@@ -611,13 +672,16 @@ def format_propose_name_prompt(ctx: dict) -> str:
         sections.append("\n".join(pcode_lines))
 
     # Callers
+    rationales = ctx.get("caller_rationales", {})
     if ctx.get("callers"):
         lines = ["## Callers (functions that call this one)"]
         for c in ctx["callers"]:
             name = _best_name(c)
             conf = f" (confidence: {c['confidence']:.2f})" if c.get("confidence") else ""
             mod = f" [{c['module']}]" if c.get("module") else ""
-            lines.append(f"- {name} @ {c['addr']}{conf}{mod}")
+            addr_int = int(c["addr"], 16)
+            rat = f' — "{rationales[addr_int]}"' if addr_int in rationales else ""
+            lines.append(f"- {name} @ {c['addr']}{conf}{mod}{rat}")
         sections.append("\n".join(lines))
 
     # Callees
@@ -627,7 +691,9 @@ def format_propose_name_prompt(ctx: dict) -> str:
             name = _best_name(c)
             conf = f" (confidence: {c['confidence']:.2f})" if c.get("confidence") else ""
             mod = f" [{c['module']}]" if c.get("module") else ""
-            lines.append(f"- {name} @ {c['addr']}{conf}{mod}")
+            addr_int = int(c["addr"], 16)
+            rat = f' — "{rationales[addr_int]}"' if addr_int in rationales else ""
+            lines.append(f"- {name} @ {c['addr']}{conf}{mod}{rat}")
         sections.append("\n".join(lines))
 
     # Referenced strings
@@ -663,6 +729,15 @@ def format_propose_name_prompt(ctx: dict) -> str:
     # Transitive peripheral affinity
     if ctx.get("peripheral_affinity"):
         sections.append(f"## {format_affinity_context(ctx['peripheral_affinity'])}")
+
+    # Cross-function data flow
+    flow = ctx.get("data_flow", {})
+    if flow.get("writes_to") or flow.get("reads_from"):
+        sections.append(format_data_flow_context(flow))
+
+    # Known constants
+    if ctx.get("known_constants"):
+        sections.append(format_constants_context(ctx["known_constants"]))
 
     # Decompiled pseudo-C
     if ctx.get("decompiled_c"):
