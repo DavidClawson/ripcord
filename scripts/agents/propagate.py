@@ -14,7 +14,7 @@ Usage:
         --build-dir build \
         --max-rounds 4 \
         --tasks-per-round 50 \
-        --model claude-sonnet-4-20250514 \
+        --model claude-sonnet-4-6 \
         --domain-hint "FreeRTOS-based embedded application" \
         --dry-run
 """
@@ -1169,8 +1169,8 @@ def main():
         help="Maximum tasks to generate per round (default: 50)",
     )
     parser.add_argument(
-        "--model", default="claude-sonnet-4-20250514",
-        help="Claude model to use (default: claude-sonnet-4-20250514)",
+        "--model", default="claude-sonnet-4-6",
+        help="Claude model to use (default: claude-sonnet-4-6)",
     )
     parser.add_argument(
         "--domain-hint",

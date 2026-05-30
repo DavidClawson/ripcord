@@ -607,9 +607,9 @@ def main():
     parser.add_argument("--domain-hint", help="e.g. 'FNIRSI digital oscilloscope'")
     parser.add_argument("--output", help="Output report path (markdown)")
     # Model selection
-    parser.add_argument("--model", default="claude-sonnet-4-20250514",
+    parser.add_argument("--model", default="claude-sonnet-4-6",
                         help="Model for levels 0-3 (default: Sonnet)")
-    parser.add_argument("--synthesis-model", default="claude-opus-4-20250514",
+    parser.add_argument("--synthesis-model", default="claude-opus-4-8",
                         help="Model for level 4 synthesis (default: Opus)")
     # Tuning
     parser.add_argument("--concurrency", type=int, default=8)

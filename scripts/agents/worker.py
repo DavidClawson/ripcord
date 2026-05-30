@@ -13,7 +13,7 @@ Usage:
     uv run python scripts/agents/worker.py \\
         --db build/coordination.sqlite \\
         --build-dir build \\
-        --model claude-sonnet-4-20250514 \\
+        --model claude-sonnet-4-6 \\
         --max-tasks 5 \\
         --dry-run
 """
@@ -608,7 +608,7 @@ def main():
                         help="Path to coordination.sqlite")
     parser.add_argument("--build-dir", default="build",
                         help="Path to build directory with parquet warehouse")
-    parser.add_argument("--model", default="claude-sonnet-4-20250514",
+    parser.add_argument("--model", default="claude-sonnet-4-6",
                         help="Claude model to use")
     parser.add_argument("--max-tasks", type=int, default=5,
                         help="Max number of tasks to process")

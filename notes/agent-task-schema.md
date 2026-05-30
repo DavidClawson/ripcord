@@ -156,7 +156,7 @@ CREATE INDEX idx_evidence_task   ON evidence_log (task_id);
 CREATE TABLE agent_runs (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     agent_id        TEXT NOT NULL,
-    model           TEXT NOT NULL,           -- e.g. 'claude-sonnet-4-20250514'
+    model           TEXT NOT NULL,           -- e.g. 'claude-sonnet-4-6'
     task_id         INTEGER REFERENCES tasks(id),
     started_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
     completed_at    TEXT,

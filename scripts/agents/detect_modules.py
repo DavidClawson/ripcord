@@ -10,7 +10,7 @@ Usage:
     uv run python scripts/agents/detect_modules.py \
         --target pico_freertos_hello_stripped \
         --build-dir build \
-        --model claude-sonnet-4-20250514 \
+        --model claude-sonnet-4-6 \
         --domain-hint "FreeRTOS-based embedded application" \
         --dry-run
 """
@@ -896,8 +896,8 @@ def main():
         help="Path to build directory with parquet warehouse",
     )
     parser.add_argument(
-        "--model", default="claude-sonnet-4-20250514",
-        help="Claude model to use (default: claude-sonnet-4-20250514)",
+        "--model", default="claude-sonnet-4-6",
+        help="Claude model to use (default: claude-sonnet-4-6)",
     )
     parser.add_argument(
         "--domain-hint",

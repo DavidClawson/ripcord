@@ -7,7 +7,7 @@ and LLM analysis into a conversational interface for firmware RE.
 Usage:
     scripts/analyze --target stock_v120
     scripts/analyze --target stock_v120 "what writes to USART2_DR?"
-    scripts/analyze --target stock_v120 --model claude-sonnet-4-20250514 "trace the scope init"
+    scripts/analyze --target stock_v120 --model claude-sonnet-4-6 "trace the scope init"
     scripts/analyze --target stock_v120 --dry-run "what functions touch SPI3?"
 """
 
@@ -158,7 +158,7 @@ class FirmwareAnalyzer:
         self,
         target: str,
         build_dir: str = "build",
-        model: str = "claude-sonnet-4-20250514",
+        model: str = "claude-sonnet-4-6",
         dry_run: bool = False,
     ):
         import duckdb
@@ -842,8 +842,8 @@ def main() -> int:
     parser.add_argument(
         "--model",
         "-m",
-        default="claude-sonnet-4-20250514",
-        help="Anthropic model to use (default: claude-sonnet-4-20250514)",
+        default="claude-sonnet-4-6",
+        help="Anthropic model to use (default: claude-sonnet-4-6)",
     )
     parser.add_argument(
         "--build-dir",

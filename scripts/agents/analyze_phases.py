@@ -13,7 +13,7 @@ Usage:
     uv run python scripts/agents/analyze_phases.py \
         --target stock_v120 \
         --build-dir build \
-        --model claude-sonnet-4-20250514 \
+        --model claude-sonnet-4-6 \
         --domain-hint "FNIRSI handheld digital oscilloscope" \
         --min-size 2000
 
@@ -510,7 +510,7 @@ def main():
     )
     parser.add_argument("--target", required=True)
     parser.add_argument("--build-dir", default="build")
-    parser.add_argument("--model", default="claude-sonnet-4-20250514")
+    parser.add_argument("--model", default="claude-sonnet-4-6")
     parser.add_argument("--domain-hint")
     parser.add_argument("--min-size", type=int, default=2000,
                         help="Min function size in bytes to decompose (default: 2000)")
