@@ -30,16 +30,41 @@ import sys
 from pathlib import Path
 
 
-# Peripheral address ranges for the LM3S6965 / Cortex-M3 platform.
-# These map address ranges to human-readable peripheral names.
-PERIPHERAL_MAP = [
-    (0x4000C000, 0x4000CFFF, "uart0"),
-    (0x4000D000, 0x4000DFFF, "uart1"),
-    (0x4001C000, 0x4001CFFF, "uart2"),
-    (0x4000E000, 0x4000EFFF, "gpio"),
-    (0x400FE000, 0x400FEFFF, "sysctl"),
-    (0xE000E000, 0xE000EFFF, "nvic"),
-]
+# Peripheral address ranges per platform, mapping ranges to human-readable
+# names. Selected by --platform (default: lm3s6965, the Zephyr target).
+PERIPHERAL_MAPS = {
+    # TI Stellaris LM3S6965 / Cortex-M3 (Zephyr qemu_cortex_m3).
+    "lm3s6965": [
+        (0x4000C000, 0x4000CFFF, "uart0"),
+        (0x4000D000, 0x4000DFFF, "uart1"),
+        (0x4001C000, 0x4001CFFF, "uart2"),
+        (0x4000E000, 0x4000EFFF, "gpio"),
+        (0x400FE000, 0x400FEFFF, "sysctl"),
+        (0xE000E000, 0xE000EFFF, "nvic"),
+    ],
+    # ArteryTek AT32F403A / Cortex-M4F (FNIRSI 2C53T, STM32F1-compatible
+    # map). FPGA-facing peripherals (spi3, usart2, dma1/2, gpiob/c) are the
+    # interesting ones; see notes/renode-at32-bringup.md.
+    "at32f403a": [
+        (0x40003C00, 0x40003FFF, "spi3"),      # MCU<->FPGA data/command
+        (0x40004400, 0x400047FF, "usart2"),    # MCU<->FPGA command channel
+        (0x40010000, 0x400103FF, "afio"),
+        (0x40010800, 0x40010BFF, "gpioa"),
+        (0x40010C00, 0x40010FFF, "gpiob"),     # PB6 (CS), PB11 (gate)
+        (0x40011000, 0x400113FF, "gpioc"),     # PC6 (enable)
+        (0x40011400, 0x400117FF, "gpiod"),
+        (0x40011800, 0x40011BFF, "gpioe"),
+        (0x40012400, 0x400127FF, "adc1"),
+        (0x40012800, 0x40012BFF, "adc2"),
+        (0x40013000, 0x400133FF, "spi1"),
+        (0x40013800, 0x40013BFF, "usart1"),
+        (0x40020000, 0x400203FF, "dma1"),      # sample transfer
+        (0x40020400, 0x400207FF, "dma2"),
+        (0x40021000, 0x400213FF, "rcc"),
+        (0x40022000, 0x400223FF, "flash"),
+        (0xE000E000, 0xE000EFFF, "nvic"),      # incl. SysTick
+    ],
+}
 
 # Regex patterns for the two line types we care about.
 # Instruction line: "0xABC: 0xOPCODE"
@@ -51,15 +76,15 @@ RE_MMIO = re.compile(
 )
 
 
-def classify_peripheral(addr: int) -> str | None:
+def classify_peripheral(addr: int, peripheral_map) -> str | None:
     """Return peripheral name for an MMIO address, or None."""
-    for lo, hi, name in PERIPHERAL_MAP:
+    for lo, hi, name in peripheral_map:
         if lo <= addr <= hi:
             return name
     return None
 
 
-def parse_trace(trace_path: Path, scenario: str):
+def parse_trace(trace_path: Path, scenario: str, peripheral_map):
     """Yield MMIO event dicts from a Renode execution trace file."""
     current_pc: int | None = None
     sequence_idx = 0
@@ -87,7 +112,7 @@ def parse_trace(trace_path: Path, scenario: str):
                     "value": value,
                     "direction": direction,
                     "scenario": scenario,
-                    "peripheral": classify_peripheral(address),
+                    "peripheral": classify_peripheral(address, peripheral_map),
                 }
                 sequence_idx += 1
                 continue
@@ -106,6 +131,12 @@ def main() -> int:
         help="scenario name stamped into every record (e.g. 'boot')",
     )
     parser.add_argument(
+        "--platform",
+        default="lm3s6965",
+        choices=sorted(PERIPHERAL_MAPS),
+        help="peripheral address map to classify against (default: lm3s6965)",
+    )
+    parser.add_argument(
         "--output", required=True, type=Path, help="output JSONL file"
     )
     args = parser.parse_args()
@@ -114,11 +145,12 @@ def main() -> int:
         print(f"error: {args.trace} does not exist", file=sys.stderr)
         return 1
 
+    peripheral_map = PERIPHERAL_MAPS[args.platform]
     args.output.parent.mkdir(parents=True, exist_ok=True)
 
     count = 0
     with args.output.open("w") as out:
-        for event in parse_trace(args.trace, args.scenario):
+        for event in parse_trace(args.trace, args.scenario, peripheral_map):
             out.write(json.dumps(event) + "\n")
             count += 1
 

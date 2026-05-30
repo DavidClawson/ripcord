@@ -1,0 +1,54 @@
+# Renode scenario: boot FNIRSI 2C53T stock V1.2.0 against an instrumented
+# FPGA stub, and capture the MCU<->FPGA MMIO transcript.
+#
+# Usage (from repo root, so $CWD and the script path resolve correctly):
+#   /Applications/Renode.app/Contents/MacOS/renode --disable-xwt --console \
+#       scripts/renode/stock_v120_boot.resc
+#
+# Then turn the trace into the warehouse mmio_events schema:
+#   uv run python scripts/renode/parse_trace.py \
+#       --trace build/stock_v120_exec_trace.log --platform at32f403a \
+#       --scenario boot --output build/stock_v120/tables/../mmio_events.jsonl
+#   (then ingest as usual; see notes/renode-at32-bringup.md)
+#
+# What it does:
+#   1. Creates the AT32F403A machine (Cortex-M4F + STM32F1 map + FPGA stub)
+#   2. Loads the raw app image at its real base (0x08004000)
+#   3. Boots from the app vector table (no bootloader emulated)
+#   4. Traces every instruction + MMIO access
+#   5. Runs 5 virtual seconds, then quits
+#
+# Outputs:
+#   build/renode_stock_v120_boot.log   — session log (unmapped-access warnings)
+#   build/stock_v120_exec_trace.log    — PC+opcode + MemoryIO trace (capture source)
+#
+# EXPECT THE FIRST RUN TO STALL. The stub returns placeholder FPGA replies,
+# so the firmware will spin or branch to an error path at the first poll
+# whose expected value we have not modeled. That stall is data: read the
+# poll loop from the decompile, encode the expected response into
+# scripts/renode/fpga_protocol.py, and re-run. See the bring-up notes.
+
+mach create "stock_v120"
+machine LoadPlatformDescription @scripts/renode/at32f403a.repl
+
+# Raw image (no ELF entry point); load at the app base address.
+sysbus LoadBinary @targets/stock_v120/stock_v120.bin 0x08004000
+
+# Boot from the app vector table: VTOR + initial SP/PC come from the
+# first two words of the image. Backticks evaluate the bus reads inline.
+cpu VectorTableOffset 0x08004000
+cpu SP `sysbus ReadDoubleWord 0x08004000`
+cpu PC `sysbus ReadDoubleWord 0x08004004`
+
+# Unmapped peripheral accesses surface here — they tell you which
+# peripheral to model next as the bring-up loop progresses.
+logLevel -1 sysbus
+logFile $CWD/build/renode_stock_v120_boot.log true
+
+# Primary MMIO capture: PC+opcode per instruction plus MemoryIORead/Write
+# for every bus access (parsed by scripts/renode/parse_trace.py).
+cpu CreateExecutionTracing "tracer" $CWD/build/stock_v120_exec_trace.log PCAndOpcode
+tracer TrackMemoryAccesses
+
+emulation RunFor "0:0:5"
+quit

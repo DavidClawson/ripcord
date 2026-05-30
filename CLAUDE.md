@@ -17,20 +17,47 @@ The name: pull a ripcord on a parachute, and a carefully packed
 structure tumbles out and inflates into something functional. Same
 operation, applied to firmware.
 
-## Current state (as of 2026-04-08)
+The tooling is deliberately generic, but the **primary driving target
+is the FNIRSI 2C53T oscilloscope firmware** (AT32F403A MCU + an opaque
+Gowin FPGA). The hardest, most valuable parts of that firmware are the
+esoteric FPGA-timing and acquisition routines — the precise behavior of
+those is exactly what would make ripcord a genuinely powerful tool, and
+is the north star the pipeline is built to reach. See the FNIRSI note
+on naming history under "Non-goals."
+
+## Current state (as of 2026-05-29)
 
 **Phase 0 complete. Phase 1 library-ID validated end-to-end including
-blind recovery on a stripped binary. Stage 2 (Renode traces) and
-Stage 4 (Datalog derivations) proven as standalone tools.** Eight
-targets in the warehouse across two build ecosystems (5 Pico + 2
-Zephyr + 1 stripped). P-Code feature extraction working on all
-targets. Renode MMIO trace capture working on Zephyr. Souffle
-reachability derivations working on both ecosystems.
+blind recovery on a stripped binary. Phase 3 agent swarm validated
+end-to-end. Stage 2 (Renode traces) and Stage 4 (Datalog derivations)
+wired into Snakemake. Deep hierarchical analysis, context enrichment,
+and Unicorn execution-validation built on top.** Fifteen targets in the
+warehouse across four build ecosystems (5 Pico + 2 Zephyr + 1 stripped
++ 3 AT32 reference + 4 stock FNIRSI). A one-command driver
+(`scripts/ripcord.py`), a conversational analyzer (`scripts/analyze`),
+an HTML report renderer, and an MCP server expose the warehouse to
+humans and LLM clients.
+
+### What you can do in one command
+
+- `scripts/ripcord.py firmware.bin --chip AT32F403A --base-addr 0x08004000`
+  — identify ISA/load-address, run Ghidra extraction, ingest to Parquet,
+  recover calls, classify peripherals, emit a summary. ELF inputs skip
+  the manual flags (`scripts/ripcord.py firmware.elf`).
+- `scripts/identify.py firmware.bin` — ISA, load address, chip family,
+  and suggested Ghidra flags, before committing to a full run.
+- `scripts/analyze --target stock_v120 "what writes to USART2_DR?"` —
+  conversational analysis over the warehouse + decompiled C + LLM.
+- `scripts/agents/deep_analysis.py --target <t>` — full bottom-up
+  hierarchical comprehension (see below).
+- `scripts/render/report.py stock_v120` — self-contained HTML report.
+- `uv run python scripts/mcp_server.py` — MCP server over the warehouse.
 
 ### Warehouse contents (per target)
 
-Every `snakemake --cores 4 --resources ghidra=1` run produces up to
-eight Parquet tables per target under `build/<target>/tables/`:
+A `snakemake --cores 4 --resources ghidra=1` run produces typed Parquet
+tables per target under `build/<target>/tables/`. Agent/validation
+stages add more:
 
 | table                   | grain                                          |
 |-------------------------|------------------------------------------------|
@@ -40,14 +67,19 @@ eight Parquet tables per target under `build/<target>/tables/`:
 | `xrefs`                 | one row per non-call reference (reads, writes, jumps, data) |
 | `strings`               | one row per defined string in loaded memory    |
 | `pcode_features`        | one row per function with P-Code opcode histogram and sequence hash |
+| `decompiled`            | one row per function with Ghidra decompiled pseudo-C |
 | `recovered_calls`       | one row per recovered indirect call edge (vector table, func ptr, veneer, registrar) |
-| `mmio_events`           | one row per MemoryIORead/Write from a Renode trace (scenario-scoped) |
 | `peripheral_xrefs`      | one row per peripheral register access from a function (SVD-resolved) |
+| `mmio_events`           | one row per MemoryIORead/Write from a Renode trace; scenario-scoped variants `mmio_events_boot` / `mmio_events_steady` |
+| `functions_enriched`    | functions plus fingerprint/match write-back and enrichment columns |
+| `unicorn_smoke`         | per-function executability result from the Unicorn smoke test (code-vs-data) |
 | `ground_truth_functions`| one row per `nm -S` T/t symbol (regression signal) |
 
 All tables are auto-discovered as DuckDB views by `scripts/query`.
 The warehouse is a tree of Parquet files, not an embedded DB file
-(see `notes/design-decisions.md` §D15).
+(see `notes/design-decisions.md` §D15). The Phase 3 agent swarm uses a
+separate SQLite coordination DB (`build/coordination.sqlite`: `tasks`,
+`evidence_log`, `agent_runs`) per `notes/agent-task-schema.md`.
 
 ### Targets currently in the warehouse
 
@@ -64,141 +96,186 @@ The warehouse is a tree of Parquet files, not an embedded DB file
 | `at32_hal_blinky`               | Cortex-M4   | AT32 SDK, GCC -O2, nano | 51  | 54    | 175  | 325   | 1       | 37    |
 | `at32_freertos_hello`           | Cortex-M4   | AT32 SDK + FreeRTOS, GCC -O2 | 133 | 211 | 671  | 1157  | 10      | 113   |
 | `at32_hal_blinky_llvm`          | Cortex-M4   | AT32 SDK, LLVM 19 -O2  | 44  | 49    | 185  | 265   | 1       | 31    |
-| `stock_v103`                    | Cortex-M4   | FNIRSI V1.0.3, Keil    | 269 | —     | —    | —     | —       | —     |
-| `stock_v107`                    | Cortex-M4   | FNIRSI V1.0.7, Keil    | 287 | —     | —    | —     | —       | —     |
-| `stock_v112`                    | Cortex-M4   | FNIRSI V1.1.2, Keil    | 306 | —     | —    | —     | —       | —     |
-| `stock_v120`                    | Cortex-M4   | FNIRSI V1.2.0, Keil    | 305 | —     | —    | —     | —       | —     |
+| `stock_v103`                    | Cortex-M4   | FNIRSI 2C53T V1.0.3, Keil | 269 | —   | —    | —     | —       | —     |
+| `stock_v107`                    | Cortex-M4   | FNIRSI 2C53T V1.0.7, Keil | 287 | —   | —    | —     | —       | —     |
+| `stock_v112`                    | Cortex-M4   | FNIRSI 2C53T V1.1.2, Keil | 306 | —   | —    | —     | —       | —     |
+| `stock_v120`                    | Cortex-M4   | FNIRSI 2C53T V1.2.0, Keil | 305 | —   | —    | —     | —       | —     |
 
 Additionally, `zephyr_hello_world` has 394 MMIO events from a 2s
-Renode boot trace.
+Renode boot trace; `zephyr_synchronization` has boot + steady-state
+scenario traces.
 
 Five Pico targets share a build config (M0+, -O3, newlib); one is
 the stripped variant of `pico_freertos_hello` (blind recovery test
 target, no symbols). Two Zephyr targets share a different build
-config (M3, -Os, picolibc). Three AT32F403A targets test the stock
-firmware's chip family with GCC and LLVM compilers. Four stock
-firmware versions span V1.0.3-V1.2.0 (raw binary imports).
+config (M3, -Os, picolibc). Three AT32F403A targets test the FNIRSI
+chip family with GCC and LLVM compilers (the cross-compiler reference
+corpus). Four stock FNIRSI 2C53T firmware versions span V1.0.3-V1.2.0
+(raw binary imports) and are the primary target plus their own
+differential ground truth.
 
 ### Key empirical findings (newest first)
 
-1. **Agent swarm validated end-to-end.** Full loop: task generation
-   → context assembly → Claude API → response parsing → evidence
-   log → ground truth validation. On symboled target: 10/10 exact
-   matches (100%). On stripped binary (blind): 37/50 correct (74%
-   accuracy), 33 exact + 3 contained + 1 similar. Wrong cases are
-   veneer trampolines, tiny structural twins, printf internals.
-   Cost: $0.10/10 tasks. Confidence well-calibrated: wrong answers
-   0.75-0.85, correct answers 0.95-1.00.
+1. **Deep hierarchical analysis: bottom-up firmware comprehension.**
+   `scripts/agents/deep_analysis.py` runs a 5-level synthesis — Level 0
+   leaves (Unicorn smoke test → propagation names all functions → phase
+   decomposition splits monster functions), Level 1 per-phase LLM
+   analysis, Level 2 subsystem groups, Level 3 function narratives,
+   Level 4 a whole-binary architecture doc (Opus). Each level sees only
+   the compressed output of the level below, so the model reasons about
+   architecture, not raw code.
 
-2. **Multi-signal cross-compiler matching works.** Weighted
-   combination of 7 signals (size, blocks, calls, peripheral
-   addresses, strings, body hash, read/write pattern) identifies
-   functions across different compilers where single-signal matching
-   fails. 12 high-confidence matches in stock Keil firmware from
-   GCC reference builds. Standalone tool at
-   `scripts/match/match_functions.py`.
+2. **Context enrichment lifts agent accuracy.** Seven enrichment/
+   validation signals feed the agent prompts: register-name annotation
+   (`register_map.py`), transitive peripheral affinity via call-graph
+   propagation (`peripheral_affinity.py`), shared-global producer/
+   consumer data-flow pairs (`data_flow.py`), known-constant scanning of
+   decompiled C (`known_constants.py`), module membership
+   (`detect_modules.py`), and Unicorn smoke results. Module clustering is
+   deterministic; only the final labeling calls an LLM.
 
-2. **Constant-based fingerprinting: 100% precision, cross-compiler.**
-   Three signals — peripheral register sets, full constant sets,
-   string references — all achieve 100% precision. Constant sets
-   correctly identify 82 functions in blind recovery on stripped
-   binary. String matching tracks functions across stock firmware
-   versions (FAT32 handler, BSP init, printf formatter). See
+3. **Agent swarm validated end-to-end.** Full loop: task generation →
+   context assembly → Claude API → response parsing → evidence log →
+   ground truth validation. On symboled target: 10/10 exact matches
+   (100%). On stripped binary (blind): 37/50 correct (74% accuracy),
+   33 exact + 3 contained + 1 similar. Wrong cases are veneer
+   trampolines, tiny structural twins, printf internals. Cost: $0.10/10
+   tasks. Confidence well-calibrated: wrong 0.75-0.85, correct
+   0.95-1.00. **These numbers were measured on `claude-sonnet-4-20250514`;
+   the agent-script defaults were bumped to `claude-sonnet-4-6` /
+   `claude-opus-4-8` on 2026-05-29, so the accuracy/cost figures predate
+   that change and should be re-measured before being cited as current.**
+
+4. **Unicorn smoke test catches code-vs-data misdecode.** Pass 1 runs
+   ~10 instructions from each function address; functions that crash on
+   instruction 0-1 are flagged likely-DATA. This is the #1 failure mode
+   for raw binary imports where Ghidra decodes data as code. Pass 2
+   traces memory accesses for behavioral validation against LLM claims.
+   See `scripts/validation/unicorn_validate.py`.
+
+5. **Multi-signal cross-compiler matching works.** Weighted combination
+   of 7 signals (size, blocks, calls, peripheral addresses, strings,
+   body hash, read/write pattern) identifies functions across different
+   compilers where single-signal matching fails. 12 high-confidence
+   matches in stock FNIRSI Keil firmware from GCC reference builds.
+   Standalone tool at `scripts/match/match_functions.py`.
+
+6. **Constant-based fingerprinting: 100% precision, cross-compiler.**
+   Three signals — peripheral register sets, full constant sets, string
+   references — all achieve 100% precision. Constant sets correctly
+   identify 82 functions in blind recovery on the stripped binary.
+   String matching tracks functions across stock firmware versions
+   (FAT32 handler, BSP init, printf formatter). See
    `notes/queries/constant_fingerprint.sql`.
 
-3. **Computed call recovery closes the reachability gap from 70%
-   unreachable to 12%.** Five recovery mechanisms (vector table,
-   binary constant scan, xref-based func-ptr refs, veneer jumps,
-   registrar dispatch inference) recover 46-234 edges per target
-   at ~95% blended precision. On `pico_freertos_hello`: 211/265
-   functions reachable from `main` (79.6%, up from 30.6%); only
-   32 truly unreachable from all entry points (12.1%). Works on
-   stripped binaries and raw binary imports. See
-   `scripts/recovery/recover_calls.py`.
+7. **Computed call recovery closes the reachability gap from 70%
+   unreachable to 12%.** Five recovery mechanisms (vector table, binary
+   constant scan, xref func-ptr refs, veneer jumps, registrar dispatch)
+   recover 46-234 edges per target at ~95% blended precision. On
+   `pico_freertos_hello`: 211/265 reachable from `main` (79.6%, up from
+   30.6%); only 32 truly unreachable (12.1%). Works on stripped binaries
+   and raw binary imports. `create_vector_functions.py` now runs as the
+   first Ghidra postScript. See `scripts/recovery/recover_calls.py`.
 
-4. **P-Code histogram cosine similarity fails cross-ISA.** 92% of
-   all cross-ISA pairs score >= 0.80 — no discrimination. The
-   histogram is dominated by ubiquitous opcodes (COPY, INT_ADD,
-   LOAD). Path killed; cross-ISA needs TF-IDF, multi-feature, or
-   learned embeddings. See `notes/queries/pcode_cosine.sql`.
+8. **P-Code histogram cosine fails cross-ISA.** 92% of cross-ISA pairs
+   score >= 0.80 — no discrimination; the histogram is dominated by
+   ubiquitous opcodes (COPY, INT_ADD, LOAD). Path killed; cross-ISA
+   needs TF-IDF, multi-feature, or learned embeddings. Within-ISA, exact
+   `pcode_sequence_hash` is 93-94% precision at ops >= 50. See
+   `notes/queries/pcode_cosine.sql`, `cross_isa_pcode.sql`.
 
-5. **AT32F403A reference corpus confirms stock firmware uses
-   FreeRTOS.** `vPortEnableVFP` byte-identical match between GCC
-   reference and stock V1.2.0 confirms the ARM_CM4F FreeRTOS port.
-   LLVM builds produce different code from both GCC and Keil —
-   cross-compiler matching requires multi-signal scoring, not
-   exact match.
+9. **FNIRSI 2C53T uses FreeRTOS on AT32F403A + Gowin FPGA.**
+   `vPortEnableVFP` is byte-identical between the GCC reference and
+   stock V1.2.0, confirming the ARM_CM4F FreeRTOS port. The
+   V1.0.3→V1.0.7 transition was a complete architectural rewrite of the
+   FPGA acquisition path (USART2-only → DMA/SPI3). See
+   `notes/fpga_version_evolution.md`, `notes/scope_acquisition_spec.md`.
 
-6. **Blind recovery on stripped binary: 86.6% recall, 94.9%
-   precision.** `pico_freertos_hello_stripped` (symbols removed)
-   was matched against the full-symbol `pico_freertos_hello` and
-   `pico_freertos_static` using structural 8-tuple + body_hash.
-   Of 197 stripped functions, 171 were identified (86.6% recall);
-   of those, 162 matched correctly (94.9% precision). The 9 false
-   positives are structural twins with different names — the
-   expected failure mode. This is the first end-to-end blind
-   recovery demonstration.
+10. **Blind recovery on stripped binary: 86.6% recall, 94.9%
+    precision.** `pico_freertos_hello_stripped` matched against the
+    full-symbol builds using structural 8-tuple + body_hash. 171/197
+    functions identified; 162 of those correct. The 9 false positives
+    are structural twins — the expected failure mode. First end-to-end
+    blind recovery demonstration.
 
-7. **P-Code within-ISA: 93-94% precision at ops >= 50.** Exact
-   `pcode_sequence_hash` works within-ISA but fails cross-ISA
-   (zero true positives). Histogram cosine also fails cross-ISA
-   (finding #4). Within-ISA, P-Code hash is a strong signal for
-   same-compiler matching. See `notes/queries/cross_isa_pcode.sql`.
+11. **Renode traces: 394 MMIO events from 2s boot.** Renode v1.16.1
+    boots `zephyr_hello_world` on a custom LM3S6965 platform. The
+    `mmio_events` table is joinable to `functions` by PC. See
+    `notes/renode-setup.md`.
 
-8. **Renode traces: 394 MMIO events from 2s boot.** Renode v1.16.1
-   boots `zephyr_hello_world` on custom LM3S6965 platform. The
-   `mmio_events` table is joinable to `functions` by PC. See
-   `notes/renode-setup.md`.
-
-9. **Phase 1 library-ID works end-to-end.** Structural matching
-   between `pico_freertos_hello` and `pico_freertos_static` finds
-   173 cross-target matches; 105 of those are FreeRTOS-specific.
-   The pipeline answers "which functions in this binary are
-   FreeRTOS?" using only SQL.
-
-7. **Byte-hash matching resolves all structural collisions.** The
-   `body_hash` column (SHA-256 of raw function bytes) achieves 100%
-   disambiguation on all structural twins from the Zephyr baseline.
-
-10. **Structural fingerprinting works at ~96% cluster-level
-    precision under same-build conditions.** See
-    `notes/fingerprinting-baseline.md`.
-
-11. **Ghidra's extraction is 100% complete with respect to real
-    function bodies on both test ISAs.** See
-    `notes/ghidra-extraction-notes.md`.
-
-12. **Parquet-as-truth storage was the right call.** Adding targets
-    is config-only (zero code changes). See design-decisions §D15.
+12. **Structural fingerprinting ~96% cluster-level precision under
+    same-build conditions; byte-hash resolves all structural
+    collisions.** See `notes/fingerprinting-baseline.md`. Ghidra
+    extraction is 100% complete w.r.t. real function bodies on both test
+    ISAs (`notes/ghidra-extraction-notes.md`). Parquet-as-truth was the
+    right call — adding targets is config-only (design-decisions §D15).
 
 ### Current session's recommended next move
 
-**Open-source prep and v0.1.0 release.** The pipeline now has a
-compelling demo: drop in a binary, get peripheral access map +
-function identification + agent-powered naming. Missing: LICENSE,
-public README, CONTRIBUTING.md, strip proprietary notes.
+**Give the FNIRSI FPGA spec an execution oracle.** This is the #1
+priority and the principled bottleneck: `notes/scope_acquisition_spec.md`
+is a *static* reconstruction of the MCU↔FPGA protocol with no execution
+verification, and ripcord's own thesis says no claim is canonical until
+execution-verified. The FPGA is only knowable through MCU interaction,
+and interaction is dynamic — so capture it. The deliverable is not the
+FPGA's internal logic; it is the **boundary contract**, complete enough
+that the real firmware runs to full acquisition against a software FPGA
+model with no divergence (a falsifiable definition of done).
 
-After that, two parallel threads:
+The Renode AT32F403A platform + instrumented FPGA stub is scaffolded
+(see `notes/renode-at32-bringup.md`). The loop:
 
-- **Docker corpus builder.** Ubuntu aarch64 container with gcc +
-  llvm + armclang for reference corpora across compilers.
-- **Agent swarm accuracy improvements.** Feed peripheral_xrefs
-  context into agent prompts, add decompiled pseudo-C, improve
-  veneer handling. Then run on stock firmware targets.
+1. Boot `stock_v120` in Renode with the logging FPGA stub
+   (`scripts/renode/stock_v120_boot.resc`); capture the MMIO transcript
+   into the existing `mmio_events` schema — first dynamic trace for an
+   AT32 target.
+2. Iterate poll-satisfaction: the firmware stalls at each FPGA-readiness
+   poll; read the poll loop (we have the decompile), encode the expected
+   response into `scripts/renode/fpga_protocol.py`, re-run, advance. The
+   growing model **is** the executable FPGA spec.
+3. Reconcile the captured sequence against the static spec — confirmations
+   upgrade `static-inferred → execution-verified`; divergences are
+   corrections (mostly in indirect-dispatch / DMA spots static is weakest).
+
+Cheap software-only accelerators that *seed* the stub and label opaque
+commands — run first / in parallel:
+
+- Decode the simpler V1.0.3 USART2-only FPGA protocol and align it by
+  user-facing behavior to the V1.0.7+ SPI3/DMA encoding (Rosetta Stone
+  for command semantics; `notes/fpga_version_evolution.md`).
+- Reconcile against the OpenScope-2C53T project's `fpga.c` as an
+  independent second estimate (a finding either way where they disagree;
+  not gospel — it is itself an RE artifact).
+
+`scripts/agents/deep_analysis.py --target stock_v120` is step 2, not
+step 1: it names structure and picks which loops the emulator must
+satisfy, but produces another static narrative — it cannot verify.
+
+Parallel threads still open: raw-binary loader fix in `scripts/ripcord.py`
+(detects base addr but doesn't pass `-loader BinaryLoader`); Docker
+corpus builder (gcc + llvm + armclang on aarch64); open-source prep
+(LICENSE, README, CONTRIBUTING) toward v0.1.0.
 
 ## Non-goals and constraints (read carefully)
 
-**Do not drift back toward cord-specific work.** ripcord was originally
-inspired by a proprietary firmware target called cord (ArteryTek
-AT32F403A driving an opaque FPGA) but was explicitly decoupled on
-2026-04-04. The cord binary is proprietary, buggy, and a bad first
-validation target because there is no ground truth. The cord case is
-preserved in the notes as an illustrative extreme — the
-FPGA-as-opaque-peripheral framing shaped the hardware-boundary-spec
-design — but cord is not the target and the pipeline should not be
-optimized for it. If the user asks about cord, confirm explicitly
-that they want to reopen that target before reorienting work toward
-it.
+**"cord" is a retired name — it means the FNIRSI 2C53T target.** Early
+in the project the proprietary target was code-named "cord" to avoid
+naming collisions while the tooling was generic. That decoupling is no
+longer needed: the FNIRSI 2C53T oscilloscope firmware (AT32F403A +
+opaque Gowin FPGA) is the sanctioned, primary motivating target, and
+its four public firmware versions give real differential ground truth.
+Older notes that warn against "drifting back to cord" are historical —
+treat FNIRSI scope comprehension as the goal, not a forbidden detour.
+The *substance* of the old caution still holds: the FPGA-timing code is
+genuinely opaque and has no external ground truth, so do not present
+inferred FPGA behavior as established fact (see the confidence
+discipline below).
+
+**Keep the tooling generic even while chasing FNIRSI.** ripcord's value
+is as a general firmware-comprehension pipeline; the scope is the proving
+ground, not a license to hard-code 2C53T specifics into core stages.
+Target-specific knowledge lives in `notes/` and in queries, not in the
+extractors or schema.
 
 **Do not engage with Vercel/Next.js skill suggestions.** This repo has
 nothing to do with Vercel, Next.js, or web deployment. There have been
@@ -225,6 +302,12 @@ whether that decision has already been made and why. Reopening a
 decision is fine if you have new information; repeating an argument
 that was already had is wasteful.
 
+**Confidence discipline (carried over from project memory).** Tag claims
+with provenance level; do not overstate an xref observation as a
+semantic conclusion. Always separate internal dispatch/selector codes
+from final wire-level hardware transactions. This matters most on the
+FPGA path, where static evidence is thin.
+
 ## Design decisions already locked in
 
 See `notes/design-decisions.md` for the full log with reasoning. Summary:
@@ -236,7 +319,7 @@ See `notes/design-decisions.md` for the full log with reasoning. Summary:
 - **Parquet-as-truth for the analytical warehouse, DuckDB as the
   query engine.** Per-(target, table) Parquet files under
   `build/<target>/tables/`. No persistent `.duckdb` file. SQLite is
-  still reserved for the future agent-swarm coordination layer. D3
+  the agent-swarm coordination layer (`build/coordination.sqlite`). D3
   was revisited by D15.
 - **JSONL extractor→ingest intermediate** (D4, revisited by D16).
   Debuggable, stdlib-only on the extractor side, trivial to
@@ -244,6 +327,8 @@ See `notes/design-decisions.md` for the full log with reasoning. Summary:
 - **Snakemake as orchestrator** for deterministic pipeline stages.
   Rules are target-agnostic; adding a target is one edit to
   `config.yaml`.
+- **uv for dependency management** (replaced the earlier venv flow).
+  Scripts use `#!/usr/bin/env -S uv run python` shebangs.
 - **Pico SDK blinky is the first test target.** Cortex-M0+, bare
   metal, trivial to build, full DWARF ground truth.
 - **Execution is the verification oracle, not the compiler.**
@@ -253,9 +338,9 @@ See `notes/design-decisions.md` for the full log with reasoning. Summary:
 - **The "minutes, not days" design constraint.** The deterministic
   pre-LLM pipeline must run end-to-end in minutes on a modern laptop.
   Every stage added is accountable to this.
-- **Blackboard architecture for the future agent swarm.** Agents
-  propose, tools verify, the database is the shared state, and no
-  claim enters canonical state without execution-based verification.
+- **Blackboard architecture for the agent swarm.** Agents propose,
+  tools verify, the database is the shared state, and no claim enters
+  canonical state without execution-based verification.
 
 ## Reading order for notes
 
@@ -266,104 +351,141 @@ need to read everything.
 Findings and design log (read first — these reflect current state):
 
 1. [`notes/design-decisions.md`](./notes/design-decisions.md) —
-   chronological log of architectural choices and their reasoning.
-   Check this before proposing anything that revisits a prior
-   decision. D15–D18+ are the most frequently referenced.
-2. [`notes/fingerprinting-baseline.md`](./notes/fingerprinting-baseline.md)
-   — the empirical Phase 1 baseline result. 96% structural match
-   precision under same-build conditions, essentially zero match
-   under mismatched build conditions, and what both findings mean
-   for the corpus build plan.
-3. [`notes/confidence-scheme.md`](./notes/confidence-scheme.md) —
-   defines the 0.0–1.0 confidence float, calibration anchors,
-   `evidence_method` companion column, composition and update rules.
-   Read before adding any confidence-scored column to the warehouse.
-4. [`notes/ghidra-extraction-notes.md`](./notes/ghidra-extraction-notes.md)
-   — what Ghidra captures, what it correctly omits, calibrated
-   against `nm` ground truth on both Pico and Zephyr targets. Read
-   this before worrying about any extractor coverage number in
-   isolation.
-5. [`notes/datalog-baseline.md`](./notes/datalog-baseline.md) —
-   Souffle reachability derivation results. Transitive call
-   reachability, orchestrator detection, subsystem clustering.
-   Key result: 70% of functions unreachable from `main` = ISR and
-   callback surface.
-6. [`notes/renode-setup.md`](./notes/renode-setup.md) — Renode
-   installation, LM3S6965 platform file, trace capture procedure,
-   `mmio_events` table schema, and what's needed to make it a
-   pipeline stage.
-7. [`notes/PLAN.md`](./notes/PLAN.md) — phased roadmap. Phase 0
-   done, Phase 1 library-ID validated with blind recovery, Stages 2
-   and 4 proven standalone. Open questions list updated.
+   chronological log of architectural choices. Check before proposing
+   anything that revisits a prior decision. D15–D18+ are most
+   frequently referenced.
+2. [`notes/PLAN.md`](./notes/PLAN.md) — phased roadmap with a current
+   "Status snapshot" at the top. Phase 0 done, Phase 1 + blind
+   recovery validated, Stages 2/4 wired in, Phase 3 agent swarm
+   validated. Open-questions list lives here.
+3. [`notes/agent-task-schema.md`](./notes/agent-task-schema.md) — the
+   SQLite task queue, evidence log, and context-assembly design behind
+   the Phase 3 agent swarm. Read before touching `scripts/agents/`.
+4. [`notes/fingerprinting-baseline.md`](./notes/fingerprinting-baseline.md)
+   — empirical Phase 1 baseline: 96% structural match precision
+   same-build, near-zero under mismatched builds, and what that means
+   for the corpus plan.
+5. [`notes/confidence-scheme.md`](./notes/confidence-scheme.md) —
+   the 0.0–1.0 confidence float, calibration anchors, `evidence_method`
+   companion column, composition rules. Read before adding any
+   confidence-scored column.
+6. [`notes/ghidra-extraction-notes.md`](./notes/ghidra-extraction-notes.md)
+   — what Ghidra captures vs. correctly omits, calibrated against `nm`
+   on Pico and Zephyr. Read before worrying about any coverage number
+   in isolation.
+7. [`notes/datalog-baseline.md`](./notes/datalog-baseline.md) —
+   Souffle reachability results: transitive reach, orchestrator
+   detection, subsystem clustering.
+8. [`notes/renode-setup.md`](./notes/renode-setup.md) — Renode install,
+   LM3S6965 platform file, trace capture, `mmio_events` schema.
+
+FNIRSI 2C53T target dossier (read when working the scope firmware):
+
+8a. [`notes/firmware-bringup-runbook.md`](./notes/firmware-bringup-runbook.md)
+   — **reusable recipe** for any target: opaque binary → boot triage →
+   function-level emulation → execution-verified MMIO transcript, with the
+   decision points (e.g. detecting a not-cold-bootable two-stage image).
+   Backed by the `firmware-bringup` skill and the `disasm.py` /
+   `emulate_function.py` tools.
+8b. [`notes/renode-at32-bringup.md`](./notes/renode-at32-bringup.md) —
+   **the FPGA emulation oracle**, worked example of the runbook on FNIRSI.
+   Renode AT32F403A platform + instrumented FPGA stub
+   (`scripts/renode/{at32f403a.repl,fpga_protocol.py}`), the dated run log
+   (Runs 1–3: cold-boot fails → two-stage discovery → handshake captured),
+   and how `fpga_protocol.py` grows into the execution-verified FPGA spec.
+9. [`notes/scope_acquisition_spec.md`](./notes/scope_acquisition_spec.md)
+   — synthesized MCU↔FPGA protocol spec for stock V1.2.0. The current
+   best (static) understanding the oracle verifies against.
+10. [`notes/fpga_interaction_analysis.md`](./notes/fpga_interaction_analysis.md)
+    — per-function FPGA-peripheral interaction map for V1.2.0, with a
+    provenance key on every claim.
+11. [`notes/fpga_version_evolution.md`](./notes/fpga_version_evolution.md)
+    and [`notes/version_diff_analysis.md`](./notes/version_diff_analysis.md)
+    — cross-version evolution and byte-level diff across V1.0.3–V1.2.0;
+    the differential ground truth.
+12. [`notes/state_structure_analysis.md`](./notes/state_structure_analysis.md)
+    — the ~4KB global state struct at `0x200000F8`: per-offset
+    readers/writers, scope-critical preset bytes, USART2 access.
 
 Design and architecture (read when reasoning about structure):
 
-8. [`notes/README.md`](./notes/README.md) — index and thesis summary.
-9. [`notes/goal-and-approach.md`](./notes/goal-and-approach.md) — why
-   the artifact is a database, not code.
-10. [`notes/pipeline-architecture.md`](./notes/pipeline-architecture.md)
+13. [`notes/README.md`](./notes/README.md) — index and thesis summary.
+14. [`notes/goal-and-approach.md`](./notes/goal-and-approach.md) — why
+    the artifact is a database, not code.
+15. [`notes/pipeline-architecture.md`](./notes/pipeline-architecture.md)
     — pipeline stages, warehouse model, blackboard.
 
 Reference material (read on demand):
 
-11. [`notes/tooling.md`](./notes/tooling.md) — reference sheet for
-    every tool involved and when to reach for it.
-12. [`notes/prior-art.md`](./notes/prior-art.md) — adjacent communities
-    and what to learn from them. N64 decomp scene and Asahi Linux are
-    the most relevant references.
-13. [`notes/test-corpus-and-validation.md`](./notes/test-corpus-and-validation.md)
-    — validation methodology, test-difficulty ramp, open-source
-    hardware targets.
-14. [`notes/fingerprinting.md`](./notes/fingerprinting.md) and
+16. [`notes/tooling.md`](./notes/tooling.md) — reference sheet for every
+    tool and when to reach for it.
+17. [`notes/prior-art.md`](./notes/prior-art.md) — adjacent communities
+    (N64 decomp, Asahi Linux are the most relevant).
+18. [`notes/test-corpus-and-validation.md`](./notes/test-corpus-and-validation.md)
+    — validation methodology and test-difficulty ramp.
+19. [`notes/fingerprinting.md`](./notes/fingerprinting.md) and
     [`notes/local-ml-fingerprinting.md`](./notes/local-ml-fingerprinting.md)
-    — multi-signal function classification research thread (rules
-    first, learned model later). The *empirical* Phase 1 status
-    lives in `fingerprinting-baseline.md`; these two are the
-    research design docs the baseline grew out of.
-15. [`notes/use-cases-and-strategy.md`](./notes/use-cases-and-strategy.md)
-    — market landscape, open-source-vs-paid shape, honest framing
-    about niche size.
+    — multi-signal classification research design (rules first, learned
+    model later). Empirical status is in `fingerprinting-baseline.md`.
+20. [`notes/use-cases-and-strategy.md`](./notes/use-cases-and-strategy.md)
+    — market landscape and honest niche framing.
+21. `notes/feedback_query_results.md`,
+    `notes/osc_project_feedback_2026_04_08.md` — captured user feedback
+    on query results and the oscilloscope project direction.
 
 ## Common commands
 
 ```bash
-# Full pipeline run (after a target ELF is in place)
+# One-command analysis of a fresh binary (ELF or raw)
+scripts/ripcord.py firmware.elf
+scripts/ripcord.py firmware.bin --chip AT32F403A --base-addr 0x08004000
+scripts/ripcord.py --report stock_v120          # re-render report for a built target
+
+# Identify ISA / load address / chip before a full run
+scripts/identify.py firmware.bin
+
+# Conversational analysis over the warehouse + decompiled C + LLM
+scripts/analyze --target stock_v120 "what writes to USART2_DR?"
+scripts/analyze --target stock_v120 --dry-run "trace the scope init"
+
+# Deep hierarchical (bottom-up) comprehension of a target
+uv run python scripts/agents/deep_analysis.py --target stock_v120
+
+# Cross-compiler / cross-version function identification
+scripts/match/match_functions.py --reference at32_freertos_hello --target stock_v120
+
+# Render a static HTML report
+scripts/render/report.py stock_v120
+
+# MCP server over the warehouse (any MCP client)
+uv run python scripts/mcp_server.py --build-dir ./build
+
+# Full deterministic pipeline run (after a target ELF is in place)
 snakemake --cores 4 --resources ghidra=1
+snakemake --cores 4 --resources ghidra=1 -n          # dry run / show DAG
 
-# Dry run to see the DAG without executing
-snakemake --cores 4 --resources ghidra=1 -n
-
-# Query the warehouse after a successful run
+# Query the warehouse
 scripts/query "SELECT source, COUNT(*) AS n FROM functions GROUP BY source"
+scripts/query                                        # list all auto-discovered tables
+scripts/query --repl                                 # interactive DuckDB REPL
+scripts/query < notes/queries/coverage.sql           # run a committed query file
 
-# Inspect largest functions in a specific target
-scripts/query "SELECT name, size FROM functions WHERE source='pico_blinky' ORDER BY size DESC LIMIT 20"
-
-# List all registered tables (auto-discovered from build/*/tables/*.parquet)
-scripts/query
-
-# Interactive DuckDB REPL with all tables pre-loaded as views
-scripts/query --repl
-
-# Run a committed multi-statement query file
-scripts/query < notes/queries/coverage.sql
-scripts/query < notes/queries/stage0_complete.sql
-scripts/query < notes/queries/structural_signatures.sql
-scripts/query < notes/queries/cross_target.sql
-scripts/query < notes/queries/reachability.sql
-scripts/query < notes/queries/state_structure.sql
-
-# Run Souffle derivation layer on a target
+# Souffle derivation layer
 scripts/datalog/export_facts.py pico_freertos_hello
 cd build/pico_freertos_hello/datalog && souffle scripts/datalog/reachability.dl
 
-# Run a Renode trace capture scenario
+# Renode trace capture scenario
 /Applications/Renode.app/Contents/MacOS/renode --disable-xwt --console \
     scripts/renode/zephyr_hello_boot.resc
 
+# Agent swarm (coordination DB → tasks → worker → validate)
+uv run python scripts/agents/init_db.py --db build/coordination.sqlite
+uv run python scripts/agents/generate_tasks.py --db build/coordination.sqlite --target <t>
+uv run python scripts/agents/worker.py --db build/coordination.sqlite --target <t>
+uv run python scripts/agents/validate.py --db build/coordination.sqlite --target <t>
+
 # Clean all pipeline outputs (regeneratable)
-snakemake clean
-# or: rm -rf build/
+snakemake clean        # or: rm -rf build/
 
 # Verify the PyGhidra launcher is reachable
 $GHIDRA_PYGHIDRA -H 2>&1 | tail -3
@@ -376,33 +498,37 @@ should point to on a fresh machine.
 ## Committed queries (executable documentation)
 
 `notes/queries/` holds SQL files that are both tests and reference
-examples. Each file has a header comment explaining what it does
-and why. Run any of them with `scripts/query < notes/queries/<file>.sql`.
+examples. Each file has a header comment explaining what it does and
+why. Run any of them with `scripts/query < notes/queries/<file>.sql`.
 
 | file                         | what it does                                                  |
 |------------------------------|---------------------------------------------------------------|
-| `coverage.sql`               | Ground-truth coverage (`functions` vs `ground_truth_functions`), bucketed by symbol category. Regression signal for extractor health. |
+| `coverage.sql`               | Ground-truth coverage (`functions` vs `ground_truth_functions`), bucketed by symbol category. Extractor-health regression signal. |
 | `calls_sanity.sql`           | Call graph invariants, top fan-in/fan-out, recursive CTE reachability from `main`. |
-| `stage0_complete.sql`        | Cross-table demonstration that all five Stage 0 tables work together. Includes string-based naming candidates and basic-block consistency check. |
-| `cross_target.sql`           | First multi-target joins: row-count matrix, shared function names, side-by-side coverage. |
-| `structural_signatures.sql`  | Phase 1 rule-based fingerprinting baseline. Computes per-function feature vectors and finds cross-target structural matches. See `notes/fingerprinting-baseline.md` for the interpretation. |
-| `reachability.sql`           | Stage 4 derivation layer in DuckDB: transitive call reachability from `main`, orchestrator detection, subsystem clustering by shared callees. See `notes/datalog-baseline.md`. |
-| `cross_isa_pcode.sql`        | Cross-ISA P-Code sequence hash matching. Tests D9 empirically: exact hash fails cross-ISA (M0+ vs M3), works within-ISA at 93-94% precision for ops >= 50. Demonstrates that histogram similarity is the path forward. |
-| `state_structure.sql`        | FNIRSI 2C53T global state structure (0x200000F8) access analysis: per-offset READ/WRITE xrefs, scope-critical preset bytes (+0xF68..+0xF6B), writer->reader data flow, USART2 peripheral access. See `notes/state_structure_analysis.md`. |
-| `recovered_calls.sql`        | Recovered call-edge analysis: per-target mechanism summary, vector table entries, reachability improvement (static-only vs static+recovered). |
-| `recovery_precision.sql`     | Precision measurement per recovery mechanism: vector_table/veneer/func_ptr/binary_const at 95-100%, registrar_dispatch at 89.5%. |
-| `pcode_cosine.sql`           | P-Code histogram cosine similarity cross-ISA test. Negative result: 92% of pairs score >= 0.80, no discrimination. |
-| `constant_fingerprint.sql`   | Constant-based fingerprinting: peripheral sets, full constant sets, string references. 100% precision on all three signals. |
+| `stage0_complete.sql`        | Cross-table demonstration that all Stage 0 tables work together; string-based naming candidates, basic-block consistency. |
+| `cross_target.sql`           | Multi-target joins: row-count matrix, shared function names, side-by-side coverage. |
+| `structural_signatures.sql`  | Phase 1 rule-based fingerprinting baseline: per-function feature vectors, cross-target structural matches. |
+| `composite_fingerprint.sql`  | Phase 2 baseline: combines structural 8-tuple + P-Code cosine + call-graph Jaccard + more into one composite similarity score. |
+| `constant_fingerprint.sql`   | Constant-based fingerprinting: peripheral sets, full constant sets, string references. 100% precision on all three. |
 | `multi_signal_score.sql`     | Cross-compiler function matching via weighted 7-signal similarity. The cross-compiler identification unlock. |
-| `osc_peripheral_map.sql`     | AT32F403A peripheral register access map for stock firmware. Classifies all MMIO xrefs by peripheral block, ranks by access count, identifies multi-peripheral init/driver functions. |
-| `osc_version_diff.sql`       | Cross-version comparison across all four stock firmware versions (V1.0.3-V1.2.0). Size evolution, byte-identical functions, changed/added/removed functions, version-to-version stability matrix. |
-| `osc_scope_path.sql`         | Scope acquisition call tree: reverse call graph from FPGA-facing peripherals (USART2, SPI3, DMA, FSMC/LCD). Also identifies ADC accessor functions. |
-| `osc_decompiled_search.sql`  | Pattern search across V1.2.0 decompiled pseudo-C. Finds functions referencing specific peripheral DAT_ labels, RAM globals, and DMA registers. Includes largest-function and decompile-failure listings. |
+| `reachability.sql`           | Stage 4 derivation in DuckDB: transitive reach from `main`, orchestrator detection, subsystem clustering. |
+| `recovered_calls.sql`        | Recovered call-edge analysis: per-mechanism summary, vector-table entries, reachability improvement. |
+| `recovery_precision.sql`     | Precision per recovery mechanism: vector_table/veneer/func_ptr/binary_const 95-100%, registrar_dispatch 89.5%. |
+| `computed_calls.sql`         | Recover implied call edges from function-pointer dispatch on RTOS targets. |
+| `cross_isa_pcode.sql`        | Cross-ISA P-Code sequence hash matching. Exact hash fails cross-ISA, works within-ISA at 93-94% (ops >= 50). |
+| `pcode_cosine.sql`           | P-Code histogram cosine cross-ISA test. Negative result: 92% of pairs score >= 0.80, no discrimination. |
+| `pcode_similarity.sql`       | P-Code histogram cosine as the proposed cross-ISA path where structural and exact-hash matching both fail. |
+| `peripheral_summary.sql`     | Per-function peripheral access classification from `peripheral_xrefs` at three granularities. |
+| `state_structure.sql`        | FNIRSI state struct (0x200000F8) access: per-offset READ/WRITE xrefs, scope-critical preset bytes, writer→reader flow, USART2. |
+| `fpga_interaction.sql`       | Every function touching FNIRSI FPGA-interface peripherals (SPI3, USART2, DMA1/2, GPIOB/C), transitive tree from registers up to task level. |
+| `osc_peripheral_map.sql`     | AT32F403A peripheral register access map for stock firmware; classifies MMIO xrefs by block, ranks by access count. |
+| `osc_version_diff.sql`       | Cross-version comparison across all four stock versions: size evolution, byte-identical fns, changed/added/removed, stability matrix. |
+| `osc_scope_path.sql`         | Scope acquisition call tree: reverse call graph from FPGA-facing peripherals; ADC accessor functions. |
+| `osc_decompiled_search.sql`  | Pattern search across V1.2.0 decompiled pseudo-C for peripheral DAT_ labels, RAM globals, DMA registers. |
 
-When you discover a query that's worth keeping, add it here as a
-new `.sql` file with a clear header comment. These files double as
-regression tests — if a future extractor change breaks one, you
-want to know immediately.
+When you discover a query worth keeping, add it here as a new `.sql`
+file with a clear header comment. These files double as regression
+tests — if a future extractor change breaks one, you want to know.
 
 ## Repository layout
 
@@ -412,66 +538,79 @@ ripcord/
 ├── README.md                         (human-facing project overview)
 ├── SETUP.md                          (toolchain prerequisites)
 ├── Snakefile                         (pipeline DAG)
-├── config.yaml                       (target binary list, arch per target)
-├── .gitignore
-├── notes/                            (design notes, authoritative)
-│   ├── README.md
-│   ├── goal-and-approach.md
-│   ├── pipeline-architecture.md
-│   ├── PLAN.md
+├── config.yaml                       (target binary list, arch + svd per target)
+├── notes/                            (design notes + target dossier, authoritative)
 │   ├── design-decisions.md           (append-only; D1-D18+ current)
-│   ├── tooling.md
-│   ├── prior-art.md
-│   ├── test-corpus-and-validation.md
-│   ├── fingerprinting.md             (research design, rule-based)
-│   ├── local-ml-fingerprinting.md    (research design, learned)
-│   ├── fingerprinting-baseline.md    (EMPIRICAL current state of Phase 1)
-│   ├── ghidra-extraction-notes.md    (calibrated extractor findings)
-│   ├── confidence-scheme.md          (0.0–1.0 float, evidence_method, composition rules)
-│   ├── datalog-baseline.md           (Souffle reachability results + findings)
-│   ├── renode-setup.md               (Renode install, LM3S6965 platform, trace capture)
-│   ├── use-cases-and-strategy.md
-│   └── queries/                      (committed SQL, executable docs)
-│       ├── coverage.sql
-│       ├── calls_sanity.sql
-│       ├── stage0_complete.sql
-│       ├── cross_target.sql
-│       ├── structural_signatures.sql
-│       ├── reachability.sql          (Stage 4: transitive reach, orchestrators, clusters)
-│       ├── cross_isa_pcode.sql       (P-Code hash matching: within-ISA + cross-ISA)
-│       └── state_structure.sql      (FNIRSI state struct access: offsets, writers, readers, USART2)
+│   ├── PLAN.md                       (phased roadmap + status snapshot)
+│   ├── agent-task-schema.md          (Phase 3 SQLite queue + evidence log design)
+│   ├── confidence-scheme.md
+│   ├── fingerprinting-baseline.md    (EMPIRICAL Phase 1 state)
+│   ├── ghidra-extraction-notes.md
+│   ├── datalog-baseline.md
+│   ├── renode-setup.md
+│   ├── scope_acquisition_spec.md     (FNIRSI MCU↔FPGA protocol spec)
+│   ├── fpga_interaction_analysis.md  (V1.2.0 FPGA interaction map)
+│   ├── fpga_version_evolution.md     (FPGA path evolution across versions)
+│   ├── version_diff_analysis.md      (byte-level cross-version diff)
+│   ├── state_structure_analysis.md   (0x200000F8 global state struct)
+│   ├── goal-and-approach.md, pipeline-architecture.md, tooling.md, prior-art.md
+│   ├── fingerprinting.md, local-ml-fingerprinting.md
+│   ├── test-corpus-and-validation.md, use-cases-and-strategy.md
+│   ├── feedback_query_results.md, osc_project_feedback_2026_04_08.md
+│   └── queries/                      (committed SQL, executable docs — see table above)
 ├── scripts/
+│   ├── ripcord.py                    (one-command end-to-end driver)
+│   ├── identify.py                   (ISA / load-addr / chip detection)
+│   ├── analyze                       (conversational warehouse + decompiled-C + LLM)
 │   ├── query                         (SQL over build/*/tables/*.parquet)
-│   ├── recovery/
-│   │   └── recover_calls.py          (standalone call recovery: vector table, binary constants, registrar dispatch)
-│   ├── datalog/
-│   │   ├── reachability.dl           (Souffle: transitive reachability + derived facts)
-│   │   └── export_facts.py           (warehouse → .facts TSV for Souffle)
-│   ├── renode/
-│   │   ├── parse_trace.py            (Renode exec trace → mmio_events JSONL)
-│   │   ├── lm3s6965.repl             (custom Renode platform: TI LM3S6965)
-│   │   └── zephyr_hello_boot.resc    (scenario: 2s boot of zephyr_hello_world)
-│   ├── ghidra/
-│   │   ├── export_functions.py       (PyGhidra: functions table)
-│   │   ├── export_calls.py           (PyGhidra: calls table)
-│   │   ├── export_basic_blocks.py    (PyGhidra: basic_blocks table)
-│   │   ├── export_xrefs.py           (PyGhidra: non-call xrefs)
-│   │   ├── export_strings.py         (PyGhidra: defined strings, loaded-memory filtered)
-│   │   └── export_pcode.py           (PyGhidra: P-Code opcode histograms + sequence hashes)
-│   └── ingest/
-│       ├── schemas.py                (pyarrow schemas + row transforms per table)
-│       ├── load_table.py             (generic JSONL → Parquet loader)
-│       └── load_ground_truth.py      (nm -S → Parquet, regression signal)
-└── targets/                          (test binaries, gitignored)
-    └── README.md                     (build instructions per target)
+│   ├── mcp_server.py                 (MCP server over the warehouse)
+│   ├── ghidra/                       (PyGhidra extractors)
+│   │   ├── export_functions.py / export_calls.py / export_basic_blocks.py
+│   │   ├── export_xrefs.py / export_strings.py / export_pcode.py
+│   │   ├── export_decompiler.py / export_recovered_calls.py
+│   │   └── create_vector_functions.py   (first postScript: vector-table fns)
+│   ├── ingest/
+│   │   ├── schemas.py                (pyarrow schemas + row transforms)
+│   │   ├── load_table.py             (generic JSONL → Parquet)
+│   │   ├── load_ground_truth.py      (nm -S → Parquet)
+│   │   └── write_back_fingerprints.py (→ functions_enriched)
+│   ├── recovery/recover_calls.py     (vector table, binary const, registrar dispatch)
+│   ├── analysis/
+│   │   ├── decompose.py              (split monster fns into peripheral-coherent phases)
+│   │   ├── disasm.py                 (capstone region disassembler over warehouse binaries)
+│   │   ├── vector_table.py           (ARM Cortex-M vector table parser)
+│   │   └── scatter_load.py           (Keil scatter-load table parser)
+│   ├── peripheral/
+│   │   ├── parse_svd.py              (CMSIS-SVD → register lookup)
+│   │   └── classify_peripherals.py   (xrefs + SVD → peripheral_xrefs)
+│   ├── match/match_functions.py      (multi-signal cross-compiler matcher CLI)
+│   ├── validation/unicorn_validate.py (smoke test + behavioral validation → unicorn_smoke)
+│   ├── render/report.py              (static HTML report)
+│   ├── agents/                       (Phase 3 swarm + deep analysis)
+│   │   ├── init_db.py / generate_tasks.py / context.py / worker.py / validate.py
+│   │   ├── propagate.py              (iterative propagation engine)
+│   │   ├── deep_analysis.py          (5-level bottom-up orchestrator)
+│   │   ├── analyze_phases.py         (recursive per-phase LLM analysis)
+│   │   ├── detect_modules.py         (deterministic clustering + LLM labels)
+│   │   ├── peripheral_affinity.py    (transitive peripheral affinity)
+│   │   ├── data_flow.py              (shared-global producer/consumer pairs)
+│   │   ├── register_map.py           (AT32F403A/Cortex-M register decoder)
+│   │   └── known_constants.py        (embedded magic-number scanner)
+│   ├── datalog/{reachability.dl, export_facts.py}
+│   └── renode/
+│       ├── lm3s6965.repl, at32f403a.repl   (platform definitions)
+│       ├── fpga_protocol.py          (executable FNIRSI FPGA model / stub)
+│       ├── emulate_function.py        (function-level emulation runner: entry+regs -> mmio_events)
+│       ├── parse_trace.py             (trace -> mmio_events; --platform lm3s6965|at32f403a)
+│       └── *.resc                     (boot + function-level scenarios)
+└── targets/                          (test binaries, gitignored; _svd/ holds SVDs)
 ```
 
-Every extractor, loader, and schema follows the same pattern: one
-file per concern, no surprise couplings, the `Snakefile` is the
-only place that knows how they compose. Adding a new table is
-three files: `export_<table>.py` (or extending an existing
-extractor), an entry in `schemas.py`, and an `ingest_<table>`
-rule in the `Snakefile`.
+Every extractor, loader, and schema follows the same pattern: one file
+per concern, no surprise couplings, the `Snakefile` is the only place
+that knows how they compose. Adding a new table is three files:
+`export_<table>.py` (or extending an existing extractor), an entry in
+`schemas.py`, and an `ingest_<table>` rule in the `Snakefile`.
 
 ## How the user works and what they expect from Claude
 
@@ -483,23 +622,18 @@ rule in the `Snakefile`.
   reasoning. "You're right" without substance is worse than respectful
   disagreement.
 - **Long responses are fine when they contain content.** Padding is
-  not. The test is: if you removed this paragraph, would anything be
-  lost? If no, remove it.
-- **Tool names, version specifics, and exact commands matter.**
-  "Something like this" is less useful than a literal path, command,
-  or file name.
-- **"Ultrathink" means go deep.** Without it, be efficient. The user
-  uses that signal explicitly when they want depth.
-- **Don't repeat discussions that are already in the notes.** The
-  notes supersede any specific memory claim. Read the authoritative
-  file before responding on a design question.
-- **Don't waste roundtrips.** Batch related tool calls in one message.
-  Don't re-read files you just wrote. Don't ask for clarification on
-  things you can infer from context.
+  not. If removing a paragraph loses nothing, remove it.
+- **Tool names, version specifics, and exact commands matter.** A
+  literal path, command, or file name beats "something like this".
+- **"Ultrathink" means go deep.** Without it, be efficient.
+- **Don't repeat discussions already in the notes.** The notes
+  supersede any specific memory claim. Read the authoritative file
+  before responding on a design question.
+- **Don't waste roundtrips.** Batch related tool calls. Don't re-read
+  files you just wrote. Don't ask for clarification you can infer.
 - **Scope to what was asked.** The user dislikes scope creep and
-  speculative refactoring. If something beyond the ask seems worth
-  doing, mention it as a separate suggestion rather than doing it
-  inline.
+  speculative refactoring. Mention worthwhile extras as separate
+  suggestions rather than doing them inline.
 
 ## Memory
 
@@ -510,14 +644,12 @@ Persistent project memory lives at:
   for sessions launched from the original cord folder; kept in sync
   with the ripcord-scoped memory.
 
-The current `project_ripcord.md` memory file contains the same summary
-as this CLAUDE.md plus cross-conversation context. Update both when
-fundamentals change.
+Update both when fundamentals change.
 
 ## Origin and history
 
 The full story of how this project came to exist lives in the
-conversation that produced it. The substantive outcomes of that
-conversation are captured in the notes and in `notes/design-decisions.md`.
-If you are picking up this project fresh, you should not need the
-conversation transcript — the notes are the authoritative record.
+conversation that produced it. The substantive outcomes are captured
+in the notes and in `notes/design-decisions.md`. If you are picking up
+this project fresh, you should not need the transcript — the notes are
+the authoritative record.

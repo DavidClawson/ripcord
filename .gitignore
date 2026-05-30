@@ -60,6 +60,11 @@ env/
 # Notebooks
 .ipynb_checkpoints/
 
+# Claude Code — share skills/ (and commands/), ignore transient/local bits
+.claude/worktrees/
+.claude/settings.local.json
+.claude/projects/
+
 # Editors and OS
 .DS_Store
 .vscode/

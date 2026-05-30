@@ -1,0 +1,50 @@
+# Renode scenario: function-level emulation of the FNIRSI SPI3<->FPGA handshake.
+#
+# The app is not cold-bootable (two-stage; bootloader not in our image — see
+# notes/renode-at32-bringup.md). So we enter directly at the SPI3 handshake
+# inside FUN_08027a50 Phase 20, with a synthetic register context, and trace
+# the MCU<->FPGA transcript against the instrumented FPGA stub.
+#
+# Entry: 0x0802A774 (first inline spi3_xfer, after SPI3 config + initial delay).
+# The core region 0x802A774-0x802ACB8 contains NO bl calls — pure inline SPI3
+# xfers / GPIO CS toggles / SysTick touches — so mid-function entry is clean.
+#
+# Register context (recovered from disassembly):
+#   r6 = 0x40003C08  SPI3 STS  (DT at [r6,#4] = 0x40003C0C) -> FPGA stub
+#   r4 = 0x40011000  GPIO base (CS=PB6 via [r4,lr]/[r4,ip] = GPIOB SCR/CLR)
+#   r5 = 0xE000E010  SysTick
+#   ip(r12) = 0xFFFFFC14   lr(r14) = 0xFFFFFC10   (GPIOB CLR/SCR displacements)
+#
+# Usage (from repo root):
+#   /Applications/Renode.app/Contents/MacOS/renode --disable-xwt --console \
+#       scripts/renode/stock_v120_handshake.resc
+
+mach create "stock_v120_hs"
+machine LoadPlatformDescription @scripts/renode/at32f403a.repl
+sysbus LoadBinary @targets/stock_v120/stock_v120.bin 0x08004000
+
+# Delay-reload globals the SysTick delays read (uninitialized at this entry).
+# Small values keep any delay short without degenerating to zero.
+sysbus WriteDoubleWord 0x20002B1C 0x40
+sysbus WriteDoubleWord 0x20002B20 0x40
+
+# Synthetic register context for Phase 20.
+cpu SP 0x20036F90
+cpu SetRegisterUnsafe 6 0x40003C08
+cpu SetRegisterUnsafe 4 0x40011000
+cpu SetRegisterUnsafe 5 0xE000E010
+cpu SetRegisterUnsafe 12 0xFFFFFC14
+cpu SetRegisterUnsafe 14 0xFFFFFC10
+cpu PC 0x0802A774
+
+logLevel -1 sysbus
+logFile $CWD/build/renode_stock_v120_hs.log true
+cpu CreateExecutionTracing "tracer" $CWD/build/stock_v120_hs_trace.log PCAndOpcode
+tracer TrackMemoryAccesses
+
+# Stop at the 0x3B bulk-begin (after 05/12/15 handshake, before the 115638-byte
+# upload loop). Captures the full pre-upload transcript without the long grind.
+cpu AddHook 0x0802AB28 "self.Pause()"
+
+emulation RunFor "0:0:2"
+quit

@@ -1,0 +1,129 @@
+// ArteryTek AT32F403A platform definition for Renode.
+//
+// Target: FNIRSI 2C53T stock firmware (stock_v120). The AT32F403A is
+// largely STM32F103 register-compatible, so the memory map and most
+// peripheral offsets below are the STM32F1 layout. The CPU is a
+// Cortex-M4F (FPU present — the firmware's FreeRTOS port calls
+// vPortEnableVFP, which faults without the F variant).
+//
+// This platform is built for the FPGA emulation oracle (see
+// notes/renode-at32-bringup.md), NOT for full peripheral fidelity. The
+// goal is to boot far enough to exercise the MCU<->FPGA acquisition path
+// and capture the transcript. The FPGA-facing peripherals (SPI3, USART2)
+// are instrumented Python stubs backed by scripts/renode/fpga_protocol.py;
+// the classic boot blockers (RCC clock-ready, Flash) return ready values;
+// everything else is plain storage memory that the execution tracer will
+// surface on demand as the bring-up loop progresses.
+//
+// Memory map (AT32F403A, 1MB flash variant):
+//   Flash:  0x08000000 - 0x080FFFFF (1 MB; app image starts at 0x08004000)
+//   SRAM:   0x20000000 - 0x20037FFF (224 KB)
+//   APB1:   0x40000000 (USART2 @ ..4400, SPI3 @ ..3C00)
+//   APB2:   0x40010000 (AFIO, GPIOA-E, ADC, SPI1, USART1)
+//   AHB:    0x40020000 (DMA1/2), 0x40021000 (RCC/CRM), 0x40022000 (Flash)
+//   NVIC:   0xE000E000 (incl. SysTick)
+
+flash: Memory.MappedMemory @ sysbus 0x08000000
+    size: 0x00100000
+
+sram: Memory.MappedMemory @ sysbus 0x20000000
+    size: 0x00038000
+
+nvic: IRQControllers.NVIC @ sysbus 0xE000E000
+    priorityMask: 0xF0
+    systickFrequency: 240000000
+    IRQ -> cpu@0
+
+cpu: CPU.CortexM @ sysbus
+    cpuType: "cortex-m4f"
+    nvic: nvic
+
+// --- Boot blockers: return "ready" so clock/flash init does not spin ---
+
+// RCC / CRM (clock control). Reads return all-ones so every HSE/PLL/HSI
+// "ready" and "lock" poll passes. Writes are stored-and-ignored.
+rcc: Python.PythonPeripheral @ sysbus 0x40021000
+    size: 0x400
+    initable: true
+    script: '''
+if request.IsRead:
+    request.Value = 0xFFFFFFFF
+'''
+
+// Flash controller (FLASH_ACR/SR/...). Reads return 0 so BSY is clear
+// (returning all-ones would leave BSY set and hang the wait-for-idle loop).
+flashctl: Python.PythonPeripheral @ sysbus 0x40022000
+    size: 0x400
+    initable: true
+    script: '''
+if request.IsRead:
+    request.Value = 0x00000000
+'''
+
+// --- Storage-only peripheral blocks (writes stored, reads return them) ---
+// GPIO output toggles (PB6/PC6/PB11 handshake), AFIO remap, ADC, etc.
+// Upgrade GPIOB/GPIOC to stubs that drive fpga_protocol set_cs/set_pc6/
+// set_pb11 once the bring-up loop needs the real handshake gating.
+apb2: Memory.ArrayMemory @ sysbus 0x40010000
+    size: 0x4000
+
+// DMA1 (0x40020000) + DMA2 (0x40020400). Transfer-complete is normally
+// IRQ-driven; if a poll on DMA TC stalls, model it here.
+dma: Memory.ArrayMemory @ sysbus 0x40020000
+    size: 0x800
+
+// --- FPGA boundary: instrumented stubs backed by fpga_protocol.py -------
+
+// SPI3 @ 0x40003C00 — the primary MCU<->FPGA data/command channel.
+// STS (0x08) returns TXE|RXNE so polled transfers progress; DT (0x0C)
+// routes through the FpgaModel (idle-HIGH until the bulk cal table is
+// uploaded, per the spec). State persists across requests via the
+// scope created at isInit.
+spi3: Python.PythonPeripheral @ sysbus 0x40003C00
+    size: 0x400
+    initable: true
+    script: '''
+if request.IsInit:
+    import sys, os
+    # Find fpga_protocol.py: RIPCORD_RENODE_DIR (set by emulate_function.py),
+    # else scripts/renode relative to cwd (works when launched from repo root).
+    for _p in (os.environ.get("RIPCORD_RENODE_DIR"),
+               os.path.join(os.getcwd(), "scripts", "renode")):
+        if _p and _p not in sys.path:
+            sys.path.append(_p)
+    try:
+        import fpga_protocol
+        model = fpga_protocol.FpgaModel()
+        # Scaffold shortcut: pretend the enable/gate lines are already
+        # HIGH so the data interface only gates on the cal upload. Replace
+        # with real GPIO-driven set_pc6/set_pb11 when modeling the handshake.
+        model.set_pc6(True)
+        model.set_pb11(True)
+    except Exception:
+        model = None
+elif request.IsRead:
+    _off = request.Offset
+    if _off == 0x08:          # SPI_STS
+        request.Value = 0x03  # TXE | RXNE
+    elif _off == 0x0C:        # SPI_DT
+        request.Value = model.spi_read_dt() if model is not None else 0xFF
+    else:
+        request.Value = 0x00
+elif request.IsWrite:
+    if request.Offset == 0x0C and model is not None:   # SPI_DT
+        model.spi_write_dt(request.Value)
+'''
+
+// USART2 @ 0x40004400 — early/command channel to the FPGA. STS (0x00)
+// returns TXE|TC so the boot command bytes go out; DT (0x04) reads return
+// 0 (no verified FPGA->MCU USART replies modeled yet).
+usart2: Python.PythonPeripheral @ sysbus 0x40004400
+    size: 0x400
+    initable: true
+    script: '''
+if request.IsRead:
+    if request.Offset == 0x00:    # USART_STS
+        request.Value = 0xC0      # TXE | TC
+    else:
+        request.Value = 0x00
+'''
