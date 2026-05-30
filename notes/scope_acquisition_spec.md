@@ -12,6 +12,76 @@ receiving live oscilloscope ADC data via SPI3.
 
 ---
 
+## CORRECTION (2026-05-29): SPI3 is control/cal only; XMC NE1 is the LCD; acquisition DMA is DMA2-Ch4
+
+A full trace-back of every SPI3, DMA, and XMC access in `stock_v120`
+(static — xref + decompile, **not yet execution-verified**) shows the
+"Purpose" line above mis-frames the data path. **This banner was revised
+once mid-analysis**: an intermediate version claimed "XMC = FPGA data
+plane," which was wrong — the decoded XMC register indices are the
+ILI9341/ST7789 LCD command set (see below). The corrected model:
+
+- **SPI3 is control/cal only.** All 206 SPI3 accesses live in one
+  function (`FUN_08027a50`); there is *no* SPI3 programmed-IO data read
+  anywhere else. The `05/12/15` handshake is **fire-and-forget** — every
+  `DT` read is discarded on the next instruction (verified exhaustively
+  over `0x0802A774–0x0802AED8`; no `cmp`/branch ever consumes an FPGA
+  reply byte). SPI3's only payload is the 115,638-byte cal-table upload
+  (`0x3B…0x3A`). **The handshake reply VALUES are unknowable from MCU-side
+  execution — the firmware never looks. Only a hardware trace or the Gowin
+  bitstream can fill them.** [direct-xref]
+
+- **XMC NE1 (`0x60000000`) is the LCD display controller, not the FPGA.**
+  The `0x6001FFFE` writes are LCD command/index writes; `0x60020000` is
+  the data register (FSMC A16 = RS). The decoded command set is textbook
+  ILI9341/ST7789: `0x11` Sleep-Out, `0x29` Display-ON, `0x2A/0x2B/0x2C`
+  Column/Page/Memory-Write, `0x2E` Memory-Read, `0x36` MADCTL, `0x3A`
+  pixel-format, `0xB2–0xE1` power/gamma; panel `0x140×0xF0` = 320×240.
+  `0xA000xxxx` (`BK1CTRL1/TMG1/TMGWR1/EXT1`) configures XMC bus timing for
+  that bank. [direct-xref — register IDs match the standard DCS table]
+
+- **DMA1-Channel2 is the framebuffer blit, not acquisition.**
+  `C2CMAR = 0x60020000` (LCD data port); ~150 KB transfer. Its ISR
+  (`0x08009670`, Ghidra-missed — the only non-default DMA ISR) and the
+  software twin `FUN_08022aac` manage a linked list of framebuffer/dirty
+  regions (head `0x20000138`), clearing a marker table (`0x2000107c`) via
+  `memset` (`FUN_080052bc`) and firing a wrap callback (`*0x20001070`).
+  `FUN_080263bc` (mode `0x55`, 320×240, floats) is waveform
+  **rasterization**, not sample scaling. [decompile-derived]
+
+- **DMA2-Channel4 is the DAC signal generator, not acquisition.**
+  `C4PADDR = &DAT_40007414` = `DAC_DHR12R2` (DAC ch2 12-bit right-aligned),
+  `C4MADDR = &DAT_20000f5a` (SRAM waveform LUT of `0x6xx` 12-bit codes),
+  circular, `C4DTCNT = 100`, request-mux source `6`. This is the built-in
+  signal/cal output, an output path. [direct-xref + decompile-derived]
+
+- **USART2 is a byte-framed bidirectional message bus to the FPGA, not a
+  sample stream.** Runtime DT access lives in one ISR (`FUN_0802b7b4`):
+  magic header `0x5AA5`/`0xAA55`, one byte per RX interrupt into `rx_buf`
+  `0x20004E11` (count `0x20004E10`), **10/12-byte command/status frames**
+  dispatched to a FreeRTOS task (PendSV via `ICSR`), TX from `0x20000005`.
+  Byte-polled framed messaging — structurally incapable of carrying raw
+  high-speed samples. [decompile-derived]
+
+- **CLOSED: raw high-speed scope samples do not transit the MCU.** Every
+  channel is accounted for and none carries raw samples: SPI3 control/cal
+  only; USART2 a low-rate framed message bus; both DMA streams outputs
+  (LCD, DAC); no DMA-in; no high-rate input peripheral; XMC only the LCD
+  bank. The FPGA samples/triggers/decimates internally; its high-speed
+  acquisition/timing logic is in the opaque Gowin bitstream, **not in this
+  firmware** — reachable only by hardware observation. This bounds what the
+  MCU binary can ever yield. [synthesized-model, convergent]
+
+Net: SPI3 = control/cal; USART2 = framed message bus; XMC NE1 = LCD;
+DMA1-Ch2 = display blit; DMA2-Ch4 = DAC siggen. **The recoverable deliverable
+is the boundary contract** (the SPI3 + USART2 command/frame protocol), not an
+acquisition algorithm. OPEN SUB-QUESTION: the format of any *reduced*
+waveform-trace frame the MCU renders — a larger USART2 frame type vs the FPGA
+driving a display layer directly. That is the next decode target; it is
+distinct from the now-closed no-raw-samples claim.
+
+---
+
 ## Confidence and Provenance
 
 Every major claim in this document carries one of these evidence levels:

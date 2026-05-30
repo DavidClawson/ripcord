@@ -245,6 +245,100 @@ Next: move `--stop` past the upload loop to capture the cal-table stream and
 the `0x3A` close, then drive the GPIO stub (PB6/PC6/PB11) so the data
 interface gates on the real handshake rather than the scaffold shortcut.
 
+### Static trace-back (2026-05-29) — separating control / display / acquisition
+
+Before extending the emulation, a full warehouse trace-back of every SPI3,
+DMA, and XMC access answered the question the handshake capture raised: *the
+firmware read `0xFF` on every SPI3 `DT` read and never complained — does it
+check the replies?* It does not, and chasing that opened up the board's three
+distinct data paths. **All of the following is static (disasm + decompile) —
+not execution-verified.**
+
+**A self-correction is recorded here on purpose.** An intermediate conclusion
+held that the XMC window (`0x6001FFFE`/`0x60020000`) was the FPGA acquisition
+interface. Decoding the register indices written to `0x6001FFFE` refuted
+that: they are the **ILI9341/ST7789 LCD command set**, so XMC NE1 is the
+**display**, not the FPGA. Lesson (confidence discipline): a memory-mapped
+register strobe is not self-labeling — decode the actual register IDs before
+naming the device.
+
+**1. SPI3 = control/cal only; handshake is fire-and-forget.** All 206 SPI3
+accesses are inside `FUN_08027a50`; no SPI3 programmed-IO data read anywhere
+else. Over `0x0802A774–0x0802AED8`, every `ldr r0,[r6,#4]` (DT read) is
+overwritten on the next instruction — no `cmp`, no branch, no store. **The
+FPGA's handshake reply values are therefore unknowable from MCU-side
+execution; only hardware/bitstream can fill them. That is the honest ceiling
+of the oracle on the control plane.** SPI3's payload is the 115,638-byte cal
+upload (`0x3B…0x3A`).
+
+**2. XMC NE1 (`0x60000000`) = LCD controller (ILI9341/ST7789-family).**
+`0x6001FFFE` = command/index register, `0x60020000` = data register (FSMC A16
+= RS). Decoded command immediates (written once at init in `FUN_08027a50`):
+
+| index | LCD command | index | LCD command |
+|---|---|---|---|
+| `0x11` | Sleep Out | `0x36` | MADCTL (mem access ctrl) |
+| `0x29` | Display ON | `0x3A` | pixel format (COLMOD) |
+| `0x2A` | Column Address Set | `0x2E` | Memory Read |
+| `0x2B` | Page Address Set | `0xB2–0xE1` | frame/power/gamma config |
+| `0x2C` | Memory Write | | |
+
+Panel = `0x140 × 0xF0` (320×240). The dominant runtime idiom is a
+3-register burst whose indices live in an SRAM descriptor at `0x20008340`:
+`+0xa`=`0x2A` (Column), `+0xc`=`0x2B` (Page), `+8`=`0x2C` (Mem-Write) — i.e. a
+windowed framebuffer write (`FUN_080067E8` sets the column/page window, then
+streams pixels). Values are initialised in `FUN_08027a50`
+(`_DAT_20008348=0x2c`, `_DAT_2000834a=0x2a`, `_DAT_2000834c=0x2b`,
+`_DAT_20008340=0x140`, `_DAT_20008342=0xf0`).
+
+**3. DMA1-Channel2 = framebuffer blit.** `C2CMAR = 0x60020000` (LCD data
+port); ~150 KB. It is the only DMA channel with a non-default ISR
+(`0x08009670`, Ghidra-missed; all others share trap `0x08007345`). The ISR
+and its software twin `FUN_08022aac` manage a linked list of dirty/framebuffer
+regions (head `0x20000138`), clear a 16-bit marker table (`0x2000107c`,
+indexed `(pos−base)>>5`, bounded `< 0xAF` 1 KB-blocks ≈ 174 KB) via `memset`
+(`FUN_080052bc` = `memset`), and fire a wrap callback `(*0x20001070)(0)`.
+`FUN_080263bc` (mode `0x55`, 320×240, floats) is waveform **rasterization**.
+
+| structure | addr | role |
+|---|---|---|
+| LCD descriptor | `0x20008340` | `+0`=w(0x140) `+2`=h(0xf0) `+8`=`0x2c` `+0xa`=`0x2a` `+0xc`=`0x2b` |
+| control block | `0x20001070` | `+0` wrap-cb, `+8` fb base, `+0xc` marker table, `+0x10` enable |
+| dirty-list head | `0x20000138` | linked list of framebuffer regions |
+| enable byte | `0x20001080` | display live — set `=1` by `FUN_08027a50` |
+
+**4. DMA2-Channel4 is the DAC signal generator — also an output, not
+acquisition.** (This corrects an intermediate claim that DMA2-Ch4 was the
+acquisition path.) `C4PADDR = &DAT_40007414` = `DAC_DHR12R2`,
+`C4MADDR = &DAT_20000f5a` (SRAM waveform LUT, `0x6xx` 12-bit codes),
+circular, `C4DTCNT = 100`, request-mux source `6`. The 2C53T's built-in
+signal/cal output. Armed in `FUN_08027a50` at `0x08029A66`.
+
+**5. The bulk scope-sample acquisition path is NOT located.** Only two DMA
+streams exist (DMA1-Ch2 = LCD blit, DMA2-Ch4 = DAC siggen) and **both are
+outputs**. XMC configures only NE1 (the LCD bank), so the FPGA is not on a
+second parallel-bus bank. SPI3 has no DMA and no reads outside init. So the
+sample path is either **polled SPI3 in undiscovered/merged code**, or an
+**FPGA-driven ISR** (EXTI / TMR3 / etc.) Ghidra did not surface as a
+function. The disciplined way to find it without another mislabel: **trace
+the input buffer of the rasterizer `FUN_080263bc` (320×240, mode `0x55`)
+backward to whoever fills it** — that producer is the acquisition path.
+
+**What this means for the oracle.** Three of the board's data channels are
+now positively identified (SPI3 control, XMC/DMA1-Ch2 LCD, DMA2-Ch4 DAC) and
+**none is the scope-sample path**. Do **not** build a `0x6001FFFE` stub (LCD)
+or a DMA2-Ch4 source stub (DAC) for the acquisition oracle — both would model
+an output. The next move is identification, not modeling: find the sample
+producer (rasterizer-input trace, or audit the undiscovered ISR/handler code
+for a peripheral read that feeds a large SRAM buffer). Only once the real
+source peripheral is known does an execution stub make sense.
+
+**Methodological note.** Two labels in this analysis were wrong before being
+corrected (XMC→"FPGA data", then DMA2-Ch4→"acquisition"). Both came from
+naming a transport by its *existence* rather than by decoding its register
+IDs / endpoints. The corrected facts above are decode-backed; the open item
+(#5) is deliberately left unlabeled until its endpoint is decoded.
+
 ## Scaffold simplifications to revisit
 
 - **GPIO is storage-only.** `at32f403a.repl` maps GPIOA–E as plain
