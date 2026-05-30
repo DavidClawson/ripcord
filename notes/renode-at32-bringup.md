@@ -413,14 +413,45 @@ plane (command→FPGA-effect still terminates in state-struct writes) and the
 real sample/handshake reply *values*, which remain the oracle's ceiling
 without hardware.
 
-### Run 6 (next) — widen the verified surface
+### Run 6 (2026-05-30) — full 9-mode dispatch map EXECUTION-VERIFIED
 
-- Emulate the other capture modes (roll = `cmd 3` → rings `state+0x356/+0x483`;
-  modes 6/7/8 SPI3-write `state+0x16/0x18`/trim; mode 9's 5-transaction 16-bit
-  ADC-ref read with the embedded `0x0A` opcode) the same post-receive way, to
-  execution-verify the full 9-mode map.
-- Model the GPIO handshake lines (PB6/PC6/PB11) as real stubs so the data
-  interface gates on the handshake, not the scaffold shortcut (see below).
+Swept command bytes 1–9 through the same post-receive entry (`0x0803B4C2`,
+command staged at `[sp+0x36]`), per-mode state-byte setup via `--mem` so gated
+handlers exercise their real path, `RIPCORD_FPGA_SAMPLE_PATTERN=1`. The
+`cmd → case N-1` dispatch is confirmed for all nine; per-handler behavior:
+
+| cmd | mode | SPI3 DT stream | SRAM (state) writes | status |
+|----:|------|----------------|---------------------|--------|
+| 1 | range/settling gate | (not run) | — | decompile-derived (flash LUT 0x0804D833 logic) |
+| 2 | write FPGA mode byte | `02 55` | — | ✅ writes `state+0x14` |
+| 3 | **roll** | `03 FF FF FF FF` | `+0x482`, `+0x5AF`, `+0xDB6` | ✅ CH2/CH1 raw + fill-count |
+| 4 | **burst** (1st half) | `04` + 1024×`FF` | 1024 contig → `+0x5B0` | ✅ (Run 5) |
+| 5 | **burst** (2nd half) | `05` + 1024×`FF` | 1024 contig → `+0x9B0` | ✅ 2048-B two-half buffer |
+| 6 | write channel mode | `06 66` | — | ✅ writes `state+0x16` |
+| 7 | write trigger mode | `07 77` | — | ✅ writes `state+0x18` |
+| 8 | write computed trim | `08 08` | — | ✅ **WRITE** (0x88→0x08), confirms round-2 direction fix |
+| 9 | 16-bit ADC-ref read | `09 FF FF` | `+0x46` | ✅ partial: `state+0x46` + PB6 pulse (2 GPIOB); the conditional `0x0A` 5-transaction path was NOT hit with default state |
+
+So `state+0x5B0`/`+0x9B0` (burst), `+0x356/+0x483` rings + `+0xDB6` (roll),
+`+0x14/0x16/0x18` (mode/channel/trigger writes), the computed-trim write
+direction, and `+0x46` (ADC ref) are all execution-verified. **Contract #19
+(`acq_engine_runtime`) evidence broadened from the burst path to the full
+mode map.** Honest gaps: mode 1 (range-gate) untested; mode 9's `0x0A`
+candidate FPGA opcode is on a conditional branch not reached here — still
+`inferred`.
+
+### Run 7 (next) — close the honest gaps
+
+- **Mode 1** (range/settling): set `state+0x2D` (range index) + `state+0xDB8`
+  (debounce) to drive the flash-LUT (`0x0804D833`) threshold both ways and
+  capture the `range_index` / `0x12` / `range_index+1` SPI3 writes.
+- **Mode 9's `0x0A`**: find the state condition that selects the
+  5-transaction branch (`0x0803B846: movs r0,#0xA`) and exercise it, to put
+  the candidate opcode on the wire.
+- **GPIO handshake lines** (PB6/PC6/PB11): upgrade `at32f403a.repl` from
+  storage-only GPIO to stubs that call `model.set_cs()/set_pc6()/set_pb11()`,
+  so the data interface gates on the real handshake, not the scaffold
+  shortcut — and feed real FPGA reply *values* (the hardware-bound ceiling).
 
 #### Original Run-5 plan (kept for context)
 
