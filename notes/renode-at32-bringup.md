@@ -373,11 +373,58 @@ rounds (see `notes/scope_architecture_v120.md`, `notes/scope_decode_round2.md`):
    Gowin bitstream stays `inferred` (0.75) — only a Gowin parser / hardware
    confirms that.
 
-### Run 5 (next) — execution-verify the runtime sample path
+### Run 5 (2026-05-30) — runtime BURST sample path EXECUTION-VERIFIED ✅
 
-Target: emulate `acq_engine_task` (`0x0803B454`) against the stub and confirm
-the burst read writes samples to `state+0x5B0`/`+0x9B0`. The blocker is the
-entry: the task opens by *blocking* on `xQueueReceive` —
+`acq_engine_task` (`0x0803B454`) emulated against the stub; the burst read
+writes samples to `state+0x5B0` — confirmed byte-for-byte.
+
+```
+RIPCORD_FPGA_SAMPLE_PATTERN=1 scripts/renode/emulate_function.py --target stock_v120 \
+    --entry 0x0803B4C2 --stop 0x0803B49A \
+    --reg sp=0x20036F90 --reg r7=0x40003C08 --reg r4=0x20002D78 \
+    --reg r5=0x20036FC6 --reg sb=0x200000F8 --mem 0x20036FC6=0x04 --run
+# -> spi3 write 1026 (04 cmd echo + 1024 0xFF sample dummies), read 3078
+#    (1024 DT reads = 512 CH1/CH2 pairs); gpiob write 40 (PB6 CS)
+#    trace: 1024 byte-contiguous MemoryWrites 0x200006A8..0x20000AA7
+#           = exactly state+0x5B0; in pattern mode values = 02 03 04 ...
+```
+
+The entry trick: **enter post-receive at `0x0803B4C2`** with the command byte
+staged at `[sp+0x36]` (`--mem 0x20036FC6=0x04`) and the integer context the
+prologue would set (`r7`=SPI3_STS, `r9/sb`=state, `r5`=&local_2). This
+sidesteps the blocking `xQueueReceive` entirely — no stub-return hook needed.
+Command `0x04` selects TBH case 3 = **mode 4 (burst)**; the dispatch asserts
+PB6, polls TDBE/RDBF, and the burst loop does 512 paired DT reads into
+`state+0x5B0..0x9AF`. The FPGA stub gained an env-gated
+`RIPCORD_FPGA_SAMPLE_PATTERN` mode (returns an incrementing byte instead of
+`0xFF` idle) purely to make the read→buffer flow distinguishable — the buffer
+filled `02 03 04 …`, proving each clocked-in byte lands in the next slot.
+
+**Contract #19 (`acq_engine_runtime`) promoted `decompile-derived →
+execution-verified` (0.90).** Verified: dispatch, read count, buffer address
+(state+0x5B0), and the data path. Still decompile-derived/inferred: roll +
+the other modes, the full 9-mode command map, and real sample *values* (the
+stub supplies placeholders — true values need a hardware trace).
+
+With #18 (config bitstream upload) and #19 (runtime burst) both execution-
+verified, **the SPI3 boundary — config link and runtime sample link — is now
+silicon-independent fact.** The honest open frontier is the USART2 control
+plane (command→FPGA-effect still terminates in state-struct writes) and the
+real sample/handshake reply *values*, which remain the oracle's ceiling
+without hardware.
+
+### Run 6 (next) — widen the verified surface
+
+- Emulate the other capture modes (roll = `cmd 3` → rings `state+0x356/+0x483`;
+  modes 6/7/8 SPI3-write `state+0x16/0x18`/trim; mode 9's 5-transaction 16-bit
+  ADC-ref read with the embedded `0x0A` opcode) the same post-receive way, to
+  execution-verify the full 9-mode map.
+- Model the GPIO handshake lines (PB6/PC6/PB11) as real stubs so the data
+  interface gates on the handshake, not the scaffold shortcut (see below).
+
+#### Original Run-5 plan (kept for context)
+
+The blocker was the entry: the task opens by *blocking* on `xQueueReceive` —
 `bl 0x803f1d8(*0x20002D78, &local_2, portMAX_DELAY)` at `0x0803B4BA`, loop
 `bne 0x0803B4B2` until a command byte arrives. In emulation the queue is empty,
 so a full-entry run spins. Two ways past it:

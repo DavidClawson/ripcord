@@ -29,7 +29,16 @@ Seed facts (from scope_acquisition_spec.md, V1.2.0):
   - Bulk cal upload: 0x3B "begin", 38546 3-byte records (115638 bytes),
     0x3A "end". UNTIL this upload completes, MISO is idle-HIGH (0xFF) —
     the FPGA SPI data interface is inactive.
+
+Oracle aid: set env RIPCORD_FPGA_SAMPLE_PATTERN=1 to make idle DT reads
+return an incrementing counter instead of 0xFF. This is NOT a real FPGA
+value — it lets the function-level oracle prove the sample read->buffer
+data path (e.g. acq_engine_task burst into state+0x5B0) by making each
+clocked-in byte distinguishable. Off by default so boot traces keep the
+documented MISO-idle-HIGH behavior.
 """
+
+import os
 
 # --- SPI3 (STM32F1/AT32 SPI) register offsets, relative to 0x40003C00 ---
 SPI_CTL0 = 0x00   # CR1
@@ -81,6 +90,8 @@ class FpgaModel(object):
         self._bulk_count = 0
         self._last_cmd = None
         self._miso_next = MISO_IDLE  # byte the next DT read returns
+        self._sample_ctr = 0         # incrementing sample placeholder (pattern mode)
+        self._pattern = bool(os.environ.get("RIPCORD_FPGA_SAMPLE_PATTERN"))
         self.access_log = []         # list of dicts, for debugging
 
     # -- GPIO handshake lines (driven via the GPIO stub) ------------------
@@ -148,6 +159,11 @@ class FpgaModel(object):
         rx = self._miso_next
         # After a non-bulk read the interface idles again unless streaming.
         if not self._data_interface_live():
+            # Pattern mode: hand back a distinguishable incrementing byte so
+            # the oracle can trace each sample byte into the MCU buffer.
+            if self._pattern and not self._bulk_mode:
+                rx = self._sample_ctr & 0xFF
+                self._sample_ctr += 1
             self._miso_next = MISO_IDLE
         self.access_log.append({
             "iface": "spi3", "dir": "read", "rx": rx,
