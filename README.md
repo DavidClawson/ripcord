@@ -1,168 +1,262 @@
 # ripcord
 
-A research pipeline for reverse engineering embedded firmware. Takes
-an opaque binary in and expands it into a queryable, structured fact
-database that downstream tools — deterministic analyzers, formal
-methods, and LLM agents — can operate on without ever having to read
-the raw binary.
+**Opaque firmware binary in, queryable fact database out — one command.**
 
-Pull the cord on a parachute and a carefully packed structure tumbles
-out and inflates. The goal of this pipeline is the same operation
-applied to firmware: one command, binary in, structure out.
+ripcord is a research pipeline for reverse engineering embedded firmware.
+It takes a binary with no symbols, no source, and an undocumented hardware
+peripheral, and expands it into a structured warehouse of facts —
+functions, call graph, MMIO access patterns, decompiled C, behavioral
+traces — that deterministic analyzers, formal methods, and LLM agents can
+all query without ever re-reading the raw bytes.
 
-## Design goals
+> Pull the ripcord on a parachute and a carefully packed structure tumbles
+> out and inflates into something functional. Same operation, applied to
+> firmware.
 
-- **Fast deterministic pre-processing.** Everything that doesn't
-  require human judgment — Ghidra extraction, library identification,
-  hardware trace capture, static derivation — runs unattended in
-  minutes, not hours. LLM budget is spent only on the residue that
-  deterministic tools can't handle.
-- **The database is the artifact.** The deliverable is not clean
-  source code; it is a queryable database of facts about the binary
-  (functions, basic blocks, call graph, MMIO access patterns,
-  hardware interactions, behavioral traces). Rendered source code, if
-  it exists at all, is a late-stage view over the database.
-- **Execution-based verification, not compiler-based.** Every claim
-  about what a function does is verified by running it in Unicorn and
-  diffing register/memory/MMIO deltas against the original, not by
-  whether the replacement compiles. Compilers catch type errors;
-  execution catches logic errors.
-- **Function fingerprinting as a first-class capability.** A
-  multi-signal classifier (rules → gradient-boosted features →
-  learned embeddings) identifies library code cheaply so the
-  agent swarm can focus on the genuinely novel.
-- **Hardware-boundary trace capture as ground truth.** When the
-  target has an opaque hardware peripheral (FPGA, ASIC, external
-  coprocessor), the only observable surface is the MCU's MMIO
-  interactions with it. Renode captures those traces; they anchor
-  every subsequent analysis.
+The driving target is the **FNIRSI 2C53T oscilloscope** (AT32F403A MCU + an
+opaque Gowin FPGA). The hardest, most valuable part of that firmware is the
+FPGA acquisition path — timing-critical code talking to a chip with *no
+public documentation and no source*. The only way to know what the FPGA
+does is to watch the MCU talk to it. ripcord is built to capture that
+conversation and turn it into an execution-verified protocol spec.
 
-## Status (2026-04-05)
+---
 
-**Phase 0 complete, Stage 0 wide, Phase 1 rule-based fingerprinting
-validated end-to-end on a same-build target pair.** The pipeline
-runs Ghidra headless (via PyGhidra's `pyghidraRun -H`) against every
-target in `config.yaml`, extracts per-function metadata as JSONL,
-and writes six typed Parquet tables per target under
-`build/<target>/tables/`:
+## The idea in one picture
 
-- `functions` — one row per Ghidra-discovered function
-- `calls` — one row per call site
-- `basic_blocks` — one row per CodeBlock
-- `xrefs` — non-call references (reads, writes, jumps, data)
-- `strings` — defined strings in loaded memory
-- `ground_truth_functions` — nm -S symbols (regression signal)
-
-DuckDB is the query engine over the Parquet tree — there is no
-persistent database file. See
-[`notes/PLAN.md`](./notes/PLAN.md) for the phased roadmap and
-[`notes/design-decisions.md`](./notes/design-decisions.md) §D15 for
-the Parquet-as-truth rationale.
-
-**Three targets currently in the warehouse:** Raspberry Pi Pico SDK
-blinky (Cortex-M0+, newlib, -O3), Zephyr hello_world on
-qemu_cortex_m3 (Cortex-M3, picolibc, -Os), and Zephyr
-synchronization on the same qemu_cortex_m3 board.
-
-**Phase 1 baseline result:** the rule-based structural fingerprinting
-query in `notes/queries/structural_signatures.sql` hits **~96%
-cluster-level precision** matching functions between the two Zephyr
-targets (72 of 75 cross-target clusters carry identical names). The
-same query finds essentially nothing between Pico and Zephyr because
-the build configs differ on four axes (ISA, -O level, libc, link
-surface). Empirical write-up in
-[`notes/fingerprinting-baseline.md`](./notes/fingerprinting-baseline.md);
-design decision D18 records the corpus build-matrix constraint that
-came out of this validation.
-
-## Design overview
-
-Start with [`notes/README.md`](./notes/README.md) for the index. The
-recommended reading order:
-
-1. [`notes/goal-and-approach.md`](./notes/goal-and-approach.md) — why
-   a structured fact database is the right artifact, not clean code
-2. [`notes/pipeline-architecture.md`](./notes/pipeline-architecture.md)
-   — the full pipeline design, warehouse model, and blackboard
-3. [`notes/design-decisions.md`](./notes/design-decisions.md) — the
-   architectural choices and their reasoning (append-only log)
-4. [`notes/fingerprinting-baseline.md`](./notes/fingerprinting-baseline.md)
-   — the empirical Phase 1 current state (96% precision result and
-   what it means)
-5. [`notes/ghidra-extraction-notes.md`](./notes/ghidra-extraction-notes.md)
-   — calibrated extractor findings against `nm` ground truth
-6. [`notes/PLAN.md`](./notes/PLAN.md) — phased roadmap with current
-   status markers
-7. [`notes/tooling.md`](./notes/tooling.md) — every tool involved and
-   when to reach for it
-8. [`notes/prior-art.md`](./notes/prior-art.md) — adjacent communities
-   and what to steal from them
-9. [`notes/fingerprinting.md`](./notes/fingerprinting.md) and
-   [`notes/local-ml-fingerprinting.md`](./notes/local-ml-fingerprinting.md)
-   — the function classification research design (the baseline file
-   above is the empirical status)
-10. [`notes/test-corpus-and-validation.md`](./notes/test-corpus-and-validation.md)
-    — validation methodology and the fingerprint library
-11. [`notes/use-cases-and-strategy.md`](./notes/use-cases-and-strategy.md)
-    — who else does firmware RE and why
-
-## Getting started
-
-See [`SETUP.md`](./SETUP.md) for toolchain prerequisites (Ghidra,
-Python 3.11+ with `pyghidra`, Snakemake, DuckDB, and optionally the
-Pico SDK for building the first test target).
-
-Quick start once tools are installed:
-
-```bash
-# Build a test target (see targets/README.md for options)
-cd targets && <build a blinky> && cd ..
-
-# Run the pipeline
-snakemake --cores 4
-
-# Query the warehouse (Parquet tables under build/<target>/tables/)
-scripts/query "SELECT source, name, size FROM functions ORDER BY size DESC LIMIT 10"
+```
+   firmware.bin
+        │
+        ▼
+┌───────────────────┐   deterministic, runs in minutes, no human judgment
+│  IDENTIFY         │   ISA · load address · chip family  (scripts/identify.py)
+├───────────────────┤
+│  EXTRACT (Ghidra) │   functions · calls · blocks · xrefs · strings
+│                   │   pcode · decompiled C            (PyGhidra headless)
+├───────────────────┤
+│  RECOVER          │   vector tables, func-ptr dispatch, veneers, registrars
+│                   │   → closes the call-graph reachability gap
+├───────────────────┤
+│  CLASSIFY         │   SVD-resolved peripheral register access · fingerprint
+│                   │   match library code across compilers
+├───────────────────┤
+│  TRACE (Renode)   │   boot the binary, capture MMIO transcript = ground truth
+└─────────┬─────────┘
+          ▼
+   ┌─────────────────────────────────────────┐
+   │   THE WAREHOUSE                          │   per-target Parquet tables,
+   │   build/<target>/tables/*.parquet        │   queried with DuckDB.
+   │   (no database file — Parquet is truth)  │   THIS is the artifact.
+   └─────────┬───────────────────────────────┘
+             │
+     ┌───────┴────────┬─────────────────┬──────────────────┐
+     ▼                ▼                 ▼                  ▼
+  scripts/query   LLM agent swarm   Unicorn / Renode    MCP server
+  (SQL / DuckDB)  (propose facts)   (VERIFY by          (drive it from
+                                     execution)          Claude Code)
 ```
 
-## Origin
+Two principles do the heavy lifting:
 
-ripcord was originally inspired by manual reverse-engineering work on
-a proprietary firmware target with an opaque FPGA peripheral (the
-"cord" project). The design arguments throughout the notes are
-informed by that work — the hardware-boundary spec framing in
-particular came from the FPGA case — but the pipeline is built to be
-general-purpose and is not coupled to any specific target. The cord
-firmware may become a stress-test target once ripcord is proven
-against simpler well-behaved binaries.
+1. **Execution is the verification oracle — not the compiler.** A claim about
+   what a function does is confirmed by *running* it (Unicorn) or *tracing*
+   it (Renode) and diffing register/memory/MMIO deltas against the original.
+   Compilers catch type errors; execution catches logic errors. No claim
+   becomes canonical until execution backs it. This is the part most RE
+   tooling skips (see [Related work](#related-work)).
+
+2. **The database is the artifact — not clean source code.** The deliverable
+   is a queryable set of facts about the binary. Rendered C, if it exists at
+   all, is a late-stage *view* over the database, never the goal. (Why:
+   [`notes/goal-and-approach.md`](./notes/goal-and-approach.md).)
+
+LLM budget is spent only on the *residue* deterministic tools can't resolve.
+Everything mechanical — Ghidra extraction, library identification, call
+recovery, trace capture — runs unattended in minutes.
+
+---
+
+## Quick start
+
+```bash
+# Identify ISA / load address / chip before committing to a full run
+scripts/identify.py firmware.bin
+
+# One command: identify → extract → ingest → recover calls → classify → summarize
+scripts/ripcord.py firmware.elf                                   # ELF: flags inferred
+scripts/ripcord.py firmware.bin --chip AT32F403A --base-addr 0x08004000  # raw binary
+
+# Ask questions over the warehouse + decompiled C + an LLM
+scripts/analyze --target stock_v120 "what writes to USART2_DR?"
+
+# Full bottom-up comprehension: smoke-test every function, name them,
+# decompose monsters, synthesize subsystem → architecture narratives
+uv run python scripts/agents/deep_analysis.py --target stock_v120
+
+# Render a self-contained HTML report
+scripts/render/report.py stock_v120
+
+# Expose the whole warehouse to any MCP client (e.g. Claude Code)
+uv run python scripts/mcp_server.py --build-dir ./build
+```
+
+See [`SETUP.md`](./SETUP.md) for toolchain prerequisites (Ghidra 11.2+ with
+PyGhidra, Python 3.11+, `uv`, Snakemake, DuckDB; optionally Renode and a
+cross-toolchain to build the test corpus).
+
+---
+
+## Why an MCP server is the point
+
+Most "LLM + Ghidra" tools feed a single decompiled function to a model and
+ask "what does this do?" — a fragment with no surrounding context. That
+starves the model exactly where embedded RE is hardest.
+
+ripcord inverts it. The deterministic pipeline builds a rich, *queryable*
+context first; then the [MCP server](./scripts/mcp_server.py) lets a coding
+agent (Claude Code, or any MCP client) pull precisely the tables, decompiled
+bodies, peripheral maps, and execution traces it needs, iteratively, while
+reasoning about the binary as a whole. The single-shot API paths
+(`scripts/analyze`, the agent swarm) remain for cheap, scoped, *measurable*
+sub-tasks — fingerprint matching, one function's classification — where a
+fragment genuinely is enough. Comprehension lives in the harness.
+
+---
+
+## What's in the warehouse
+
+A `snakemake --cores 4 --resources ghidra=1` run produces typed Parquet
+tables per target under `build/<target>/tables/`. Agent and validation
+stages add more. Highlights:
+
+| table                  | grain                                                        |
+|------------------------|--------------------------------------------------------------|
+| `functions`            | one row per Ghidra-discovered function (incl. `body_hash`)   |
+| `calls` / `xrefs`      | call sites; non-call references (reads, writes, jumps, data) |
+| `basic_blocks`         | one row per CodeBlock, with containing function              |
+| `strings`              | defined strings in loaded memory                             |
+| `decompiled`           | Ghidra decompiled pseudo-C, one row per function             |
+| `pcode_features`       | per-function P-Code opcode histogram + sequence hash         |
+| `recovered_calls`      | recovered indirect call edges (vector table, func ptr, …)    |
+| `peripheral_xrefs`     | SVD-resolved peripheral register accesses                    |
+| `mmio_events`          | MemoryIORead/Write from a Renode trace, joinable by PC       |
+| `unicorn_smoke`        | per-function executability (catches code-vs-data misdecode)  |
+| `ground_truth_functions` | `nm -S` symbols, the regression signal                     |
+
+All tables are auto-discovered as DuckDB views by `scripts/query`. The
+[`notes/queries/`](./notes/queries/) directory holds committed SQL that
+doubles as executable documentation and regression tests.
+
+---
+
+## Current state (2026-05)
+
+Phase 0 complete; Phase 1 library-ID validated end-to-end including blind
+recovery on a stripped binary; Phase 3 agent swarm validated end-to-end.
+Renode trace capture and Datalog (Souffle) derivations are wired into the
+Snakemake DAG. Deep hierarchical analysis, context enrichment, and Unicorn
+execution-validation are built on top.
+
+**Fifteen targets across four build ecosystems** live in the warehouse:
+5 Raspberry Pi Pico (Cortex-M0+), 2 Zephyr (Cortex-M3), 1 stripped blind-
+recovery target, 3 AT32F403A reference builds (GCC + LLVM, the cross-compiler
+corpus), and 4 stock FNIRSI 2C53T firmware versions (V1.0.3–V1.2.0) — the
+primary target *and* its own differential ground truth.
+
+A few empirical results that fell out (full list and provenance in
+[`CLAUDE.md`](./CLAUDE.md) → "Key empirical findings"):
+
+- **Blind recovery on a stripped binary: 86.6% recall, 94.9% precision** —
+  171/197 functions re-identified with zero symbols.
+- **Computed-call recovery closes the reachability gap from 70% unreachable
+  to 12%** via five recovery mechanisms at ~95% blended precision.
+- **Constant-based fingerprinting: 100% precision, cross-compiler.**
+- **Execution catches what static analysis can't** — the Unicorn smoke test
+  flags Ghidra decoding data as code, the #1 failure mode for raw imports.
+- **The FNIRSI V1.0.3→V1.0.7 transition was a full architectural rewrite of
+  the FPGA acquisition path** (USART2-only → DMA/SPI3), confirmed by
+  byte-identical FreeRTOS port code against a GCC reference build.
+
+---
+
+## Related work
+
+ripcord's individual ingredients all exist in the wild; the combination —
+a structured fact warehouse **plus** an execution-as-verification oracle
+**plus** an LLM agent swarm **plus** an MCP surface, pointed at *comprehending*
+an opaque binary — is the part I haven't found assembled elsewhere. Honest
+positioning:
+
+- **LLM + disassembler tools** (Gepetto, G-3PO, aiDAPal, DeGPT) mostly send a
+  decompiled snippet to a model and write back a rename/comment. ripcord
+  builds queryable context *first*, so the model never reasons from a
+  context-free fragment.
+- **Persistent structured state is no longer a differentiator.**
+  [GhidrAssist](https://github.com/jtang613/GhidrAssist) (open source, a
+  SQLite+graph knowledge DB with a 5-level hierarchy) and **Binary Ninja
+  Sidekick** (commercial, with provenance and a background validation agent)
+  both build it. ripcord's separation is that **their validation is static**
+  — re-analysis and cross-reference queries — whereas ripcord gates every
+  canonical claim on *execution*.
+- **MCP-over-a-disassembler is table stakes.**
+  [GhidraMCP](https://github.com/LaurieWired/GhidraMCP) (9k+ stars) and
+  [IDA Pro MCP](https://github.com/mrexodia/ida-pro-mcp) are mature. They
+  expose *live tool calls*; ripcord's MCP server exposes a *warehouse of
+  verified facts*. What's behind the MCP surface is the interesting part.
+- **Binary-analysis-as-a-database predates ripcord** —
+  [ddisasm/GTIRB](https://github.com/GrammaTech/ddisasm) (which shares
+  ripcord's Souffle/Datalog layer) and CodeQL. ripcord *uses* that technique;
+  it didn't invent it.
+- **Firmware rehosting** (PRETENDER, P2IM, DICE, Fuzzware) already infers
+  MMIO peripheral models from traces — but the deliverable is "enough model
+  to fuzz," **not** a legible, falsifiable MCU↔peripheral protocol spec.
+  Same input class, different output. ripcord aims at the legible boundary
+  contract those tools leave on the table.
+- **Matched-source decomp** (decomp.me, the N64/PSX projects) verifies by
+  byte-identical recompilation — a *stricter* oracle than ripcord's
+  behavioral execution diff, but aimed at perfect source recovery, which
+  ripcord explicitly is **not** trying to produce.
+- **Closest precedent to the core thesis:** Patrick Hulin's
+  [SimTower reimplementation](https://phulin.me/blog/simtower) put an LLM in
+  a closed loop against a Unicorn emulator as ground truth — the same
+  execution-as-oracle idea, as a one-off project rather than a general
+  pipeline.
+
+---
+
+## Where to go deeper
+
+- [`CLAUDE.md`](./CLAUDE.md) — the dense, authoritative project orientation:
+  every script, every table, every committed query, current findings.
+- [`notes/`](./notes/) — the design log and the FNIRSI target dossier. Start
+  with [`notes/README.md`](./notes/README.md). Key files:
+  [`design-decisions.md`](./notes/design-decisions.md) (why each choice was
+  made), [`pipeline-architecture.md`](./notes/pipeline-architecture.md),
+  [`scope_acquisition_spec.md`](./notes/scope_acquisition_spec.md) (the
+  MCU↔FPGA protocol), and
+  [`renode-at32-bringup.md`](./notes/renode-at32-bringup.md) (the FPGA
+  emulation oracle in action).
+
+---
+
+## Scope, honesty, and the FPGA caveat
+
+ripcord is deliberately **generic**. The scope firmware is the proving
+ground, not a license to hard-code 2C53T specifics into the core pipeline —
+target knowledge lives in `notes/` and in queries, never in the extractors.
+
+The FPGA timing code has *no external ground truth*. ripcord tags every
+claim with a provenance level and never presents inferred FPGA behavior as
+established fact: an internal dispatch/selector code is not a wire-level
+hardware transaction, and a value the firmware *wrote* is observed while a
+reply a stub *invented* is unverified until a hardware trace confirms it.
+That discipline is the whole reason the execution oracle exists.
+
+---
 
 ## License
 
-Pipeline code in this repository will be released under a permissive
-open-source license once there's enough of it to be useful. Firmware
-binaries analyzed by the pipeline are not included in this
-repository and their licensing is the property of their original
-authors.
-
-## Repository structure
-
-```
-ripcord/
-├── README.md              (this file)
-├── CLAUDE.md              (project orientation for Claude Code sessions)
-├── SETUP.md               (toolchain prerequisites)
-├── Snakefile              (pipeline definition)
-├── config.yaml            (target binary list)
-├── .gitignore
-├── notes/                 (design notes + committed queries)
-│   └── queries/           (SQL files, executable documentation)
-├── scripts/
-│   ├── query              (SQL over build/*/tables/*.parquet)
-│   ├── ghidra/            (PyGhidra extraction scripts, one per table)
-│   └── ingest/            (schemas.py, load_table.py, load_ground_truth.py)
-└── targets/               (test binaries, gitignored)
-```
-
-For the full file-level layout (every extractor, every committed
-query, every notes file) see the "Repository layout" section in
-[`CLAUDE.md`](./CLAUDE.md).
+[MIT](./LICENSE). Firmware binaries analyzed by the pipeline are **not**
+included in this repository; their licensing belongs to their original
+authors. The test corpus is built from open SDKs (Pico SDK, Zephyr, the
+AT32 SDK) or supplied by the user.

@@ -57,6 +57,9 @@ env/
 .env.local
 .env.*.local
 
+# Repo-pulse community tracking — local only, never committed
+community.md
+
 # Notebooks
 .ipynb_checkpoints/
 
