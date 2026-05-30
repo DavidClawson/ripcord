@@ -147,7 +147,9 @@ def main() -> int:
     ap.add_argument("--reg", action="append", metavar="NAME=VAL",
                     help="register context, e.g. r6=0x40003C08 (repeatable)")
     ap.add_argument("--mem", action="append", metavar="ADDR=VAL",
-                    help="pre-set RAM word, e.g. 0x20002B1C=0x40 (repeatable)")
+                    help="pre-set RAM word, e.g. 0x20002B1C=0x40 (repeatable). "
+                         "Also patches flash (MappedMemory) — e.g. NOP out a "
+                         "scheduler-yield call site with 0xADDR=0xBF00BF00.")
     ap.add_argument("--platform", default="scripts/renode/at32f403a.repl")
     ap.add_argument("--platform-map", default="at32f403a",
                     help="parse_trace peripheral map name (default: at32f403a)")

@@ -440,14 +440,51 @@ mode map.** Honest gaps: mode 1 (range-gate) untested; mode 9's `0x0A`
 candidate FPGA opcode is on a conditional branch not reached here — still
 `inferred`.
 
-### Run 7 (next) — close the honest gaps
+### Run 7 (2026-05-30) — mode 1 + mode 9 `0x0A` EXECUTION-VERIFIED
 
-- **Mode 1** (range/settling): set `state+0x2D` (range index) + `state+0xDB8`
-  (debounce) to drive the flash-LUT (`0x0804D833`) threshold both ways and
-  capture the `range_index` / `0x12` / `range_index+1` SPI3 writes.
-- **Mode 9's `0x0A`**: find the state condition that selects the
-  5-transaction branch (`0x0803B846: movs r0,#0xA`) and exercise it, to put
-  the candidate opcode on the wire.
+Same post-receive entry as Run 6 (`0x0803B4C2`, command staged at `[sp+0x36]`,
+`sb=0x200000F8`), with per-mode state setup via `--mem`.
+
+**Mode 1 — auto-range settle-then-step (case `0x0803B54C`), all three branches
+verified.** The handler reads `range_index` = `state+0x2D`, indexes the flash
+LUT at `0x0804D833`, and compares `LUT[idx]+0x32` against the debounce counter
+`state+0xDB8`. Driving the LUT gate both ways:
+
+| `state+0x2D` (idx) | `state+0xDB8` (counter) | branch | SPI3 writes |
+|--------------------|--------------------------|--------|-------------|
+| `0x05` | `0x0000` | HOLD (counter < thr) | `01 05` — re-send `range_index` |
+| `0x05` | `0xFFFF` | ADVANCE (idx ≤ 0x12) | `01 06` — `range_index+1` |
+| `0x20` | `0xFFFF` | CLAMP (idx > 0x12)   | `01 12` — clamp to `0x12` |
+
+So mode 1 is a closed-loop auto-ranger: hold the current range until the
+per-range LUT debounce expires, then step up one (or clamp at `0x12`). The
+`01` prefix is the command byte the dispatcher sends to the FPGA before the
+handler's value (same `cmd value` framing as all other modes).
+
+**Mode 9 — 16-bit ADC-ref read (case `0x0803B79C`), full sequence verified.**
+SPI3 writes `09 FF FF 0A FF FF`: cmd `09`, then five transfers assembling a
+16-bit value into `state+0x46`, with a PB6/CS pulse mid-sequence. **The `0x0A`
+(`0x0803B848: movs r0,#0xa; str r0,[r7,#4]`) is UNCONDITIONAL straight-line
+code, not a state-gated branch — this corrects the Run-6 note** ("conditional
+`0x0A` path not reached"): Run 6's sweep simply truncated mode 9 before it got
+there. The `0x0A` sits just past a **FreeRTOS yield** (`FUN_0803e390` =
+`vTaskDelay`/yield — its delay-0 path writes `0x10000000` PENDSVSET to ICSR
+`0xE000ED04`), which a no-scheduler function-level entry cannot satisfy: it
+spins forever walking the uninitialised scheduler list (`0x0803E0AC`). The
+robust fix is a **flash NOP-patch of the yield call site** — `--mem
+0x0803B824=0xBF00BF00` rewrites the `bl` to `nop; nop`, so the SPI3 sequence
+runs to completion without the yield. (A PC←LR skip *hook* was tried first and
+abandoned: Renode does not cleanly redirect PC from inside a block-begin hook;
+the `--mem` flash patch is deterministic and needs no new tool.) `0x0A` is now
+wire-level fact; its FPGA-register *semantics* remain inferred.
+
+**All nine capture-mode handlers are now execution-verified at the transaction
+level.** Contract #19 (`acq_engine_runtime`) → confidence 0.95. Residual
+unverified: real FPGA sample/reply *values* (hardware-bound — the oracle
+supplies placeholder bytes), and the GPIO handshake gating (Run 8).
+
+### Run 8 (next) — GPIO handshake + real reply values
+
 - **GPIO handshake lines** (PB6/PC6/PB11): upgrade `at32f403a.repl` from
   storage-only GPIO to stubs that call `model.set_cs()/set_pc6()/set_pb11()`,
   so the data interface gates on the real handshake, not the scaffold
