@@ -1,33 +1,36 @@
 # ripcord seed function list — stock_v120 (FNIRSI 2C53T V1.2.0)
 #
-# QUARANTINED 2026-05-30 — every address below was wrong.
+# RE-ANCHORED 2026-05-30 from stock_v120's OWN bytes (fnirsi-scope-decode
+# round 2). Each address below was independently disassembled and confirmed
+# to land on a real function prologue / clean instruction-stream start by the
+# round-2 adversarial verifier AND the coverage critic. These are the inverse
+# of the quarantined cross-source seeds: derived from THIS image, not borrowed.
 #
-# These addresses came from a cross-source decompile under
-# ~/Desktop/osc/reverse_engineering (FPGA_PROTOCOL_COMPLETE.md "Step 12",
-# fpga_task_annotated.c). That artifact is mapped to a DIFFERENT load base
-# than stock_v120.bin @ 0x08004000, so its addresses do not align here.
-# Verified directly against the bytes:
-#   - 0x08037428 (claimed spi3_acquisition_task) is a UTF-8 decoder.
-#   - 0x08037454 (the seed) is mid-function; it cut a 150 B garbage body.
-#   - 0x08037536 (claimed TBH dispatching 9 modes) is `lsls r0,r0,#0x1e`,
-#     not a table branch. The real table branches in that region are a
-#     102-case TBH @0x08037F0E and a TBB @0x08037FE6 — different dispatchers.
-#   - None of the 8 FreeRTOS task addresses disassemble to a function
-#     prologue (push {..,lr}); 7 of them failed createFunction outright.
+# They sit in the largest genuinely-missed code gap (0x0803AA4E-0x0803D0B8),
+# which Ghidra never reached because these are FreeRTOS task bodies / dispatch
+# routines entered via pointer or computed branch. Seeding them pulls the
+# runtime acquisition engine + its dispatchers into the warehouse with
+# decompiled_c — the most FPGA-relevant missed code.
 #
-# Lesson: never seed from another project's addresses without re-anchoring
-# to THIS image first. A seed is target-specific DATA and must be verified
-# against the target's own bytes.
+# Format: 0xADDR  name  [size]   (size forces full-range disassembly so a body
+# gated by an internal jump table is fully decoded, not cut at the table.)
 #
-# harvest_pointers.py (the generic pointer-harvest) replaces the *purpose*
-# of this file: it finds pointer-reached function entries (FreeRTOS task
-# bodies, callbacks) from the image's own structure — real `push {..,lr}`
-# prologues and orphan-decoded code — with no hand-authored addresses. On
-# stock_v120 it recovered 80 functions (358 -> 438) at high precision.
+# --- Runtime acquisition engine (THE prize) ---
+# 7092-byte FreeRTOS task: r7=SPI3_STS(0x40003C08), [r7+4]=SPI3_DT, state base
+# sb=0x200000F8, VFP calib (vldr s18). 9-way capture-mode dispatch via a TBH at
+# 0x0803B536 keyed on (USART2 cmd byte - 1). Burst -> state+0x5B0/+0x9B0
+# (2x512 interleaved CH1/CH2), roll rings state+0x356/+0x483. Size forces the
+# 9 TBH-gated mode handlers to decode as part of the body.
+0x0803B454  acq_engine_task          7092
+# --- Dispatchers reached by pointer/queue (settings, dvom TX, UI/key) ---
+0x0803AA50  settings_cmd_dispatcher
+0x0803B3F4  dvom_tx_task
+0x0803D008  ui_key_dispatch_task
+# --- Function Ghidra missed in the 0x0802B71C gap ---
+0x0802B71C  usb_disconnect_trigger
 #
-# Re-populate this file ONLY with addresses re-derived from stock_v120
-# itself (e.g. xTaskCreate arg constants read out of THIS binary, or a
-# decode-verified entry), each disassembly-checked to a prologue first.
-#
-# Format: 0xADDR  name  [size]
-# (empty body below => create_seed_functions.py no-ops)
+# HELD (not seeded): 0x08027A50 / 0x0802E664 are re-SEGMENTATION targets (merge
+# phantom fragments into 15486/6016-byte bodies) — forcing those risks creating
+# fresh mega-functions; revisit deliberately. 0x0802B78C is a non-prologue leaf
+# (low value). REJECTED by disasm: 0x0803AB00 (interior of 0x0803AA50),
+# 0x0802E8E4 (mid-instruction desync — the IRQ20 label is an artifact).
