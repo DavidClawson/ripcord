@@ -52,7 +52,43 @@ opaque peripheral, that transcript is the reverse-engineered interface.
      --stop <after-key-op> --reg <base-regs> --mem <globals> --run`.
 4. **Reconcile.** Diff the captured transcript against the static spec; upgrade
    confirmed facts `static-inferred → execution-verified`; iterate the
-   poll/assert-satisfaction loop until the boundary runs to completion.
+   poll/assert-satisfaction loop until the boundary runs to completion. Record
+   each promoted fact as a contract via `scripts/contracts/ledger.py` (see the
+   `execution-verify` skill) — the ledger, not prose, is the durable result.
+
+## Function-level emulation techniques (hard-won)
+
+These generalize to any two-stage / RTOS firmware where you enter a function
+without the full boot context:
+
+- **Enter past a blocking RTOS primitive.** A task that opens with
+  `xQueueReceive(…, portMAX_DELAY)` spins forever in emulation (the queue is
+  empty). Enter at the *post-receive* PC instead and stage the received value
+  in memory: `--reg sp=… --reg <base regs> --mem <stack slot>=<cmd byte>`. Read
+  the prologue with `disasm.py` to recover the exact register context
+  (peripheral base, state base, stack-arg slot) the skipped prologue would have
+  set.
+- **NOP-patch a boot/scheduler-dependent helper via `--mem`.** A `bl` to a
+  FreeRTOS yield/delay (writes `0x10000000` PENDSVSET to ICSR `0xE000ED04`) or
+  a timer-list walk needs scheduler state the entry skips, and it spins. Flash
+  is a writable `MappedMemory`, so rewrite the call site to two Thumb NOPs:
+  `--mem 0x<callsite>=0xBF00BF00`. **Do not** try to skip it with a PC←LR hook —
+  Renode does not cleanly redirect PC from a block-begin hook (it desyncs or
+  halts). The flash patch is deterministic.
+- **Share one peripheral model across stubs.** Renode runs every
+  `Python.PythonPeripheral` in one IronPython engine and imports a module once,
+  so a module-level singleton (`fpga_protocol.get_model()`) lets e.g. a GPIO
+  stub drive `set_cs()` and the SPI stub read the same `FpgaModel` — model the
+  real handshake instead of a hardcoded shortcut.
+- **Prove a data path with a distinguishable pattern.** Set
+  `RIPCORD_FPGA_SAMPLE_PATTERN=1` so idle reads return an incrementing counter;
+  a buffer that fills `02 03 04…` proves each clocked-in byte reached the MCU
+  buffer. Gate the pattern on a handshake line (CS) to *also* prove a GPIO stub
+  drives the model — a counter-filled buffer can then only mean CS was asserted.
+- **A spin balloons the trace to multiple GB.** Always cap `--duration` /
+  `--timeout`, watch for the "trace still growing" warning, and
+  `rm build/*_fn_*_trace.log` after each run. A 240 s spin once wrote a 4.8 GB
+  trace.
 
 ## Output
 

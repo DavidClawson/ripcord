@@ -51,9 +51,9 @@ conversation and turn it into an execution-verified protocol spec.
              │
      ┌───────┴────────┬─────────────────┬──────────────────┐
      ▼                ▼                 ▼                  ▼
-  scripts/query   LLM agent swarm   Unicorn / Renode    MCP server
-  (SQL / DuckDB)  (propose facts)   (VERIFY by          (drive it from
-                                     execution)          Claude Code)
+  scripts/query   LLM agent swarm   Unicorn / Renode    Claude Code
+  (SQL / DuckDB)  (bulk labeling)   (VERIFY by          (skills + CLI:
+                                     execution)          drives it all)
 ```
 
 Two principles do the heavy lifting:
@@ -96,7 +96,8 @@ uv run python scripts/agents/deep_analysis.py --target stock_v120
 # Render a self-contained HTML report
 scripts/render/report.py stock_v120
 
-# Expose the whole warehouse to any MCP client (e.g. Claude Code)
+# (optional) Expose the warehouse over MCP for a client without shell access.
+# The primary path is Claude Code running the tools + skills above directly.
 uv run python scripts/mcp_server.py --build-dir ./build
 ```
 
@@ -106,20 +107,27 @@ cross-toolchain to build the test corpus).
 
 ---
 
-## Why an MCP server is the point
+## Why the harness is the point
 
 Most "LLM + Ghidra" tools feed a single decompiled function to a model and
 ask "what does this do?" — a fragment with no surrounding context. That
 starves the model exactly where embedded RE is hardest.
 
 ripcord inverts it. The deterministic pipeline builds a rich, *queryable*
-context first; then the [MCP server](./scripts/mcp_server.py) lets a coding
-agent (Claude Code, or any MCP client) pull precisely the tables, decompiled
+context first; then **Claude Code drives** — running the CLI tools and
+skills (`.claude/skills/`) directly to pull precisely the tables, decompiled
 bodies, peripheral maps, and execution traces it needs, iteratively, while
-reasoning about the binary as a whole. The single-shot API paths
-(`scripts/analyze`, the agent swarm) remain for cheap, scoped, *measurable*
-sub-tasks — fingerprint matching, one function's classification — where a
-fragment genuinely is enough. Comprehension lives in the harness.
+reasoning about the binary as a whole *and building new tools mid-task* when
+a target demands them. Reusable procedures harden into skills
+(`firmware-bringup`, `execution-verify`); execution-verified conclusions land
+in the contract ledger (`scripts/contracts/ledger.py`), which is the durable
+product. The single-shot API paths (`scripts/analyze`, the agent swarm) stay
+for cheap, scoped, *measurable* sub-tasks — fingerprint matching, bulk
+function labeling — where a fragment genuinely is enough. An
+[MCP server](./scripts/mcp_server.py) remains as optional interop for a
+client that can't run the shell; it isn't the primary surface, because
+ripcord's data is local Parquet the driver already reads directly.
+Comprehension lives in the harness, not the access protocol.
 
 ---
 
@@ -183,9 +191,9 @@ A few empirical results that fell out (full list and provenance in
 
 ripcord's individual ingredients all exist in the wild; the combination —
 a structured fact warehouse **plus** an execution-as-verification oracle
-**plus** an LLM agent swarm **plus** an MCP surface, pointed at *comprehending*
-an opaque binary — is the part I haven't found assembled elsewhere. Honest
-positioning:
+**plus** a skills-driven Claude Code harness with a provenance-tracked
+contract ledger, pointed at *comprehending* an opaque binary — is the part I
+haven't found assembled elsewhere. Honest positioning:
 
 - **LLM + disassembler tools** (Gepetto, G-3PO, aiDAPal, DeGPT) mostly send a
   decompiled snippet to a model and write back a rename/comment. ripcord
@@ -198,11 +206,14 @@ positioning:
   both build it. ripcord's separation is that **their validation is static**
   — re-analysis and cross-reference queries — whereas ripcord gates every
   canonical claim on *execution*.
-- **MCP-over-a-disassembler is table stakes.**
-  [GhidraMCP](https://github.com/LaurieWired/GhidraMCP) (9k+ stars) and
-  [IDA Pro MCP](https://github.com/mrexodia/ida-pro-mcp) are mature. They
-  expose *live tool calls*; ripcord's MCP server exposes a *warehouse of
-  verified facts*. What's behind the MCP surface is the interesting part.
+- **MCP-over-a-disassembler is table stakes — and not where ripcord's value
+  is.** [GhidraMCP](https://github.com/LaurieWired/GhidraMCP) (9k+ stars) and
+  [IDA Pro MCP](https://github.com/mrexodia/ida-pro-mcp) are mature; they
+  expose *live tool calls* over a protocol. ripcord keeps an MCP surface only
+  as optional interop — the driver (Claude Code) reads the local warehouse
+  directly via the CLI, so the access protocol is incidental. What's behind
+  the surface — a *warehouse of execution-verified facts* and the skills that
+  produce it — is the interesting part.
 - **Binary-analysis-as-a-database predates ripcord** —
   [ddisasm/GTIRB](https://github.com/GrammaTech/ddisasm) (which shares
   ripcord's Souffle/Datalog layer) and CodeQL. ripcord *uses* that technique;

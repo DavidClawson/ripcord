@@ -35,8 +35,12 @@ and Unicorn execution-validation built on top.** Fifteen targets in the
 warehouse across four build ecosystems (5 Pico + 2 Zephyr + 1 stripped
 + 3 AT32 reference + 4 stock FNIRSI). A one-command driver
 (`scripts/ripcord.py`), a conversational analyzer (`scripts/analyze`),
-an HTML report renderer, and an MCP server expose the warehouse to
-humans and LLM clients.
+and an HTML report renderer expose the warehouse to humans and LLM
+clients. The primary way the warehouse is *driven*, though, is Claude
+Code itself running the deterministic CLI tools and skills directly
+(see "How this project is driven" below); the MCP server
+(`scripts/mcp_server.py`) is kept only as optional interop for clients
+without shell access — no longer a primary path.
 
 ### What you can do in one command
 
@@ -256,6 +260,41 @@ Parallel threads still open: raw-binary loader fix in `scripts/ripcord.py`
 corpus builder (gcc + llvm + armclang on aarch64); open-source prep
 (LICENSE, README, CONTRIBUTING) toward v0.1.0.
 
+## How this project is driven (architecture)
+
+The architecture that the FNIRSI execution-verification work settled into,
+and the one to keep building on:
+
+1. **Deterministic substrate (keep as-is).** Ghidra → Parquet warehouse →
+   recovery / fingerprinting / `disasm.py` / `emulate_function.py`. This
+   maps *all* the firmware and makes the agent's job tractable. Never have
+   the agent re-derive what determinism can guarantee. "Minutes, not days"
+   still binds this layer.
+2. **Claude Code is the reasoning driver — not a scripted API swarm.** The
+   hard comprehension (the whole FNIRSI FPGA boundary) was done by Claude
+   Code running the CLI tools, reading traces, and *building tools mid-task*
+   (the `--mem` flash-patch, entering past a blocking `xQueueReceive`, the
+   shared-model GPIO stub). Reusable procedures are captured as **skills**
+   (`.claude/skills/`: `firmware-bringup`, `execution-verify`), not as more
+   pipeline code.
+3. **The contract ledger is the durable product.** `build/contracts.sqlite`
+   (`scripts/contracts/ledger.py`) accumulates execution-verified facts with
+   provenance and a `supersedes` history. Prose evaporates; the ledger is
+   what survives a session. Promote a claim only when execution backs it.
+
+Consequences: the **scripted agent swarm** (`scripts/agents/worker.py`,
+`deep_analysis.py`, the SQLite coordination DB) is *not* the primary
+intelligence — its remaining niche is cheap **bulk mechanical labeling** at
+scale (naming hundreds of functions in parallel via API); keep it for that,
+don't grow it. The **MCP server** (`scripts/mcp_server.py`) is **optional
+interop**, not a primary interface: ripcord's data is local Parquet the
+agent already reads via `scripts/query`, so a CLI/skills surface is strictly
+simpler and loses nothing; MCP only earns its keep for a client that cannot
+run the shell (a Claude Desktop demo, third-party reuse). Demoted, not
+deleted — it is one self-contained file with zero dependents. (A formal
+`notes/design-decisions.md` entry for this is deferred while that file has
+in-flight edits from the separate GUI workstream.)
+
 ## Non-goals and constraints (read carefully)
 
 **"cord" is a retired name — it means the FNIRSI 2C53T target.** Early
@@ -457,7 +496,8 @@ scripts/match/match_functions.py --reference at32_freertos_hello --target stock_
 # Render a static HTML report
 scripts/render/report.py stock_v120
 
-# MCP server over the warehouse (any MCP client)
+# MCP server over the warehouse (OPTIONAL interop for non-shell clients;
+# not the primary path — Claude Code drives the CLI tools directly)
 uv run python scripts/mcp_server.py --build-dir ./build
 
 # Full deterministic pipeline run (after a target ELF is in place)
