@@ -1,0 +1,25 @@
+# ripcord seed function list — stock_v120 (FNIRSI 2C53T V1.2.0)
+#
+# FreeRTOS task bodies + key worker functions that Ghidra's recursive descent
+# never reached: each task is passed to xTaskCreate as a pointer, so there is
+# no direct call site to follow on this raw, symbol-less import. Addresses are
+# ground truth harvested from xTaskCreate args + bench RE
+# (~/Desktop/osc/reverse_engineering/FPGA_PROTOCOL_COMPLETE.md, "Step 12").
+#
+# Format: 0xADDR  name
+#
+# --- FreeRTOS tasks (Step 12) ---
+0x080400B9  task_Timer1
+0x080406C9  task_Timer2
+0x0803DA51  task_display
+0x08040009  task_key
+0x0804009D  task_osc
+0x0803E455  task_fpga
+0x0803E3F5  task_dvom_TX
+0x0803DAC1  task_dvom_RX
+# --- Key workers reached only via the tasks / queues ---
+# Third column = body byte length (forces full-range disassembly so a big
+# body gated by an unrecovered jump table is decoded, not cut short).
+0x08037454  spi3_acquisition_task   7208
+0x080373F4  usart_tx_frame_builder
+0x08036AC0  meter_data_processor    1776

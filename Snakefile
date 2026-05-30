@@ -34,6 +34,26 @@ TARGETS = list(config["targets"].keys())
 REPO_ROOT = Path(workflow.basedir).resolve()
 
 
+def ghidra_import_flags(target):
+    """Headless -import flags for a target.
+
+    Raw binaries (`raw_binary: true` in config) have no format header, so
+    Ghidra can't infer the language or load address — without these flags it
+    blocks on an interactive processor prompt under headless. ELF targets carry
+    that metadata in the header, so they get no extra flags (auto-detect).
+
+    `ghidra_processor` may override the language id; it defaults to the generic
+    Cortex-M Thumb variant, which covers every current raw target (AT32F403A).
+    """
+    t = config["targets"][target]
+    if not t.get("raw_binary"):
+        return ""
+    base = t["base_addr"]
+    base = hex(base) if isinstance(base, int) else str(base)
+    proc = t.get("ghidra_processor", "ARM:LE:32:Cortex")
+    return f"-loader BinaryLoader -loader-baseAddr {base} -processor {proc}"
+
+
 def targets_with_scenarios():
     """Return targets that have at least one Renode scenario configured."""
     return [t for t in TARGETS if "scenarios" in config["targets"][t]]
@@ -108,6 +128,8 @@ rule ghidra_extract:
         project_dir = lambda wc: f"build/{wc.target}/ghidra_project",
         project_name = lambda wc: wc.target,
         script_path = str(REPO_ROOT / "scripts" / "ghidra"),
+        import_flags     = lambda wc: ghidra_import_flags(wc.target),
+        seed_file        = lambda wc: str((REPO_ROOT / f"targets/{wc.target}/seeds.txt").resolve()),
         functions_out    = lambda wc: str((REPO_ROOT / f"build/{wc.target}/functions.jsonl").resolve()),
         calls_out        = lambda wc: str((REPO_ROOT / f"build/{wc.target}/calls.jsonl").resolve()),
         basic_blocks_out = lambda wc: str((REPO_ROOT / f"build/{wc.target}/basic_blocks.jsonl").resolve()),
@@ -117,17 +139,25 @@ rule ghidra_extract:
     shell:
         r"""
         mkdir -p {params.project_dir} $(dirname {output.functions_jsonl})
-        env -u VIRTUAL_ENV {GHIDRA_PYGHIDRA} -H {params.project_dir} {params.project_name} \
+        # Strip the uv .venv from PATH so pyghidraRun uses Ghidra's own bundled
+        # venv (which has PyGhidra) instead of detecting the active .venv and
+        # blocking on a "install PyGhidra into this venv?" prompt under headless.
+        GHIDRA_PATH="$(printf '%s' "$PATH" | tr ':' '\n' | grep -v '\.venv' | paste -sd ':' -)"
+        env -u VIRTUAL_ENV PATH="$GHIDRA_PATH" {GHIDRA_PYGHIDRA} -H {params.project_dir} {params.project_name} \
             -import {input.elf} \
+            {params.import_flags} \
             -overwrite \
             -scriptPath {params.script_path} \
+            -preScript set_aggressive_analysis.py \
             -postScript create_vector_functions.py \
+            -postScript create_seed_functions.py {params.seed_file} \
             -postScript export_functions.py     {params.functions_out} \
             -postScript export_calls.py         {params.calls_out} \
             -postScript export_basic_blocks.py  {params.basic_blocks_out} \
             -postScript export_xrefs.py         {params.xrefs_out} \
             -postScript export_strings.py       {params.strings_out} \
-            -postScript export_pcode.py         {params.pcode_out}
+            -postScript export_pcode.py         {params.pcode_out} \
+            < /dev/null
         test -s {output.functions_jsonl}
         test -s {output.calls_jsonl}
         test -s {output.basic_blocks_jsonl}
@@ -155,14 +185,24 @@ rule ghidra_decompile:
     params:
         project_dir = lambda wc: f"build/{wc.target}/ghidra_project",
         project_name = lambda wc: wc.target,
+        # The program inside the Ghidra project is named by the basename
+        # of the file imported in ghidra_extract (-import {elf}), not by
+        # the target name — e.g. stock_v120.bin, zephyr.elf. The -process
+        # filter must match that, or headless aborts with "Requested
+        # project program file(s) not found".
+        program_name = lambda wc: os.path.basename(config["targets"][wc.target]["elf"]),
         script_path = str(REPO_ROOT / "scripts" / "ghidra"),
         decompiled_out = lambda wc: str((REPO_ROOT / f"build/{wc.target}/decompiled.jsonl").resolve()),
     shell:
         r"""
-        env -u VIRTUAL_ENV {GHIDRA_PYGHIDRA} -H {params.project_dir} {params.project_name} \
-            -process {params.project_name} \
+        # Same .venv-strip as ghidra_extract: keep pyghidraRun on Ghidra's own
+        # venv so it doesn't block on the install-into-active-venv prompt.
+        GHIDRA_PATH="$(printf '%s' "$PATH" | tr ':' '\n' | grep -v '\.venv' | paste -sd ':' -)"
+        env -u VIRTUAL_ENV PATH="$GHIDRA_PATH" {GHIDRA_PYGHIDRA} -H {params.project_dir} {params.project_name} \
+            -process {params.program_name} \
             -scriptPath {params.script_path} \
-            -postScript export_decompiler.py {params.decompiled_out}
+            -postScript export_decompiler.py {params.decompiled_out} \
+            < /dev/null
         test -s {output.decompiled_jsonl}
         """
 
