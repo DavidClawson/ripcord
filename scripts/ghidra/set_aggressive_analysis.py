@@ -12,6 +12,7 @@
 #
 # Invoked as:  -preScript set_aggressive_analysis.py
 
+from ghidra.framework.options import OptionType
 from ghidra.program.model.listing import Program
 
 # Option names whose presence (substring match) should be forced ON. Ghidra
@@ -36,6 +37,11 @@ def main():
     print("set_aggressive_analysis: %d analysis options present" % len(names))
     enabled = 0
     for n in names:
+        # Substring matches also hit non-boolean sub-options (e.g. a
+        # "...Timeout (sec)" / "...Non-return Threshold" INT under a matched
+        # analyzer); setting those to "true" errors. Only flip booleans.
+        if opts.getType(n) != OptionType.BOOLEAN_TYPE:
+            continue
         for w in WANT_ON:
             if w.lower() in n.lower():
                 try:

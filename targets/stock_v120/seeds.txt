@@ -1,25 +1,33 @@
 # ripcord seed function list — stock_v120 (FNIRSI 2C53T V1.2.0)
 #
-# FreeRTOS task bodies + key worker functions that Ghidra's recursive descent
-# never reached: each task is passed to xTaskCreate as a pointer, so there is
-# no direct call site to follow on this raw, symbol-less import. Addresses are
-# ground truth harvested from xTaskCreate args + bench RE
-# (~/Desktop/osc/reverse_engineering/FPGA_PROTOCOL_COMPLETE.md, "Step 12").
+# QUARANTINED 2026-05-30 — every address below was wrong.
 #
-# Format: 0xADDR  name
+# These addresses came from a cross-source decompile under
+# ~/Desktop/osc/reverse_engineering (FPGA_PROTOCOL_COMPLETE.md "Step 12",
+# fpga_task_annotated.c). That artifact is mapped to a DIFFERENT load base
+# than stock_v120.bin @ 0x08004000, so its addresses do not align here.
+# Verified directly against the bytes:
+#   - 0x08037428 (claimed spi3_acquisition_task) is a UTF-8 decoder.
+#   - 0x08037454 (the seed) is mid-function; it cut a 150 B garbage body.
+#   - 0x08037536 (claimed TBH dispatching 9 modes) is `lsls r0,r0,#0x1e`,
+#     not a table branch. The real table branches in that region are a
+#     102-case TBH @0x08037F0E and a TBB @0x08037FE6 — different dispatchers.
+#   - None of the 8 FreeRTOS task addresses disassemble to a function
+#     prologue (push {..,lr}); 7 of them failed createFunction outright.
 #
-# --- FreeRTOS tasks (Step 12) ---
-0x080400B9  task_Timer1
-0x080406C9  task_Timer2
-0x0803DA51  task_display
-0x08040009  task_key
-0x0804009D  task_osc
-0x0803E455  task_fpga
-0x0803E3F5  task_dvom_TX
-0x0803DAC1  task_dvom_RX
-# --- Key workers reached only via the tasks / queues ---
-# Third column = body byte length (forces full-range disassembly so a big
-# body gated by an unrecovered jump table is decoded, not cut short).
-0x08037454  spi3_acquisition_task   7208
-0x080373F4  usart_tx_frame_builder
-0x08036AC0  meter_data_processor    1776
+# Lesson: never seed from another project's addresses without re-anchoring
+# to THIS image first. A seed is target-specific DATA and must be verified
+# against the target's own bytes.
+#
+# harvest_pointers.py (the generic pointer-harvest) replaces the *purpose*
+# of this file: it finds pointer-reached function entries (FreeRTOS task
+# bodies, callbacks) from the image's own structure — real `push {..,lr}`
+# prologues and orphan-decoded code — with no hand-authored addresses. On
+# stock_v120 it recovered 80 functions (358 -> 438) at high precision.
+#
+# Re-populate this file ONLY with addresses re-derived from stock_v120
+# itself (e.g. xTaskCreate arg constants read out of THIS binary, or a
+# decode-verified entry), each disassembly-checked to a prologue first.
+#
+# Format: 0xADDR  name  [size]
+# (empty body below => create_seed_functions.py no-ops)

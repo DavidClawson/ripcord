@@ -151,6 +151,7 @@ rule ghidra_extract:
             -preScript set_aggressive_analysis.py \
             -postScript create_vector_functions.py \
             -postScript create_seed_functions.py {params.seed_file} \
+            -postScript harvest_pointers.py \
             -postScript export_functions.py     {params.functions_out} \
             -postScript export_calls.py         {params.calls_out} \
             -postScript export_basic_blocks.py  {params.basic_blocks_out} \
