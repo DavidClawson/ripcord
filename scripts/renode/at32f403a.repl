@@ -61,11 +61,68 @@ if request.IsRead:
 '''
 
 // --- Storage-only peripheral blocks (writes stored, reads return them) ---
-// GPIO output toggles (PB6/PC6/PB11 handshake), AFIO remap, ADC, etc.
-// Upgrade GPIOB/GPIOC to stubs that drive fpga_protocol set_cs/set_pc6/
-// set_pb11 once the bring-up loop needs the real handshake gating.
-apb2: Memory.ArrayMemory @ sysbus 0x40010000
-    size: 0x4000
+// AFIO remap, EXTI, GPIOA, ADC, TIM1, SPI1, USART1, etc. GPIOB (0x40010C00)
+// is carved out below as a real handshake stub (Run 8); the rest of the
+// APB2 window stays plain storage. PC6 (GPIOC enable) is boot-configured and
+// pre-seeded HIGH in the model, so GPIOC remains storage-only here.
+apb2_lo: Memory.ArrayMemory @ sysbus 0x40010000
+    size: 0x0C00
+
+apb2_hi: Memory.ArrayMemory @ sysbus 0x40011000
+    size: 0x3000
+
+// GPIOB @ 0x40010C00 — drives the real MCU<->FPGA handshake. The firmware
+// asserts CS = PB6 (active LOW) per command and gates on PB11; this stub
+// translates SCR/CLR/ODT bit writes into fpga_protocol set_cs()/set_pb11()
+// on the SHARED model instance, so the SPI3 data interface gates on the
+// handshake the firmware actually drives, not the scaffold shortcut. SCR
+// (0x10): low 16 bits set pins HIGH, high 16 reset LOW. CLR (0x14): bits set
+// pins LOW. ODT (0x0C): output latch.
+gpiob: Python.PythonPeripheral @ sysbus 0x40010C00
+    size: 0x400
+    initable: true
+    script: '''
+if request.IsInit:
+    import sys, os
+    for _p in (os.environ.get("RIPCORD_RENODE_DIR"),
+               os.path.join(os.getcwd(), "scripts", "renode")):
+        if _p and _p not in sys.path:
+            sys.path.append(_p)
+    try:
+        import fpga_protocol
+        model = fpga_protocol.get_model()
+    except Exception:
+        model = None
+    odt = 0
+elif request.IsWrite:
+    _off = request.Offset
+    _v = request.Value
+    if _off == 0x10:                       # SCR: low16 set HIGH, high16 reset
+        _set = _v & 0xFFFF
+        _clr = (_v >> 16) & 0xFFFF
+        odt = ((odt | _set) & (~_clr & 0xFFFF)) & 0xFFFF
+        if model is not None:
+            if _set & 0x40:   model.set_cs(False)   # PB6 HIGH -> CS deassert
+            if _clr & 0x40:   model.set_cs(True)    # PB6 LOW  -> CS assert
+            if _set & 0x800:  model.set_pb11(True)
+            if _clr & 0x800:  model.set_pb11(False)
+    elif _off == 0x14:                     # CLR: bits set pins LOW
+        _clr = _v & 0xFFFF
+        odt = (odt & (~_clr & 0xFFFF)) & 0xFFFF
+        if model is not None:
+            if _clr & 0x40:   model.set_cs(True)    # PB6 LOW -> CS assert
+            if _clr & 0x800:  model.set_pb11(False)
+    elif _off == 0x0C:                     # ODT: output latch
+        odt = _v & 0xFFFF
+        if model is not None:
+            model.set_cs((odt & 0x40) == 0)         # PB6 LOW -> CS asserted
+            model.set_pb11((odt & 0x800) != 0)
+elif request.IsRead:
+    if request.Offset == 0x0C:             # ODT readback
+        request.Value = odt
+    else:                                  # IDT inputs / SCR / CLR
+        request.Value = 0
+'''
 
 // DMA1 (0x40020000) + DMA2 (0x40020400). Transfer-complete is normally
 // IRQ-driven; if a poll on DMA TC stalls, model it here.
@@ -93,10 +150,11 @@ if request.IsInit:
             sys.path.append(_p)
     try:
         import fpga_protocol
-        model = fpga_protocol.FpgaModel()
-        # Scaffold shortcut: pretend the enable/gate lines are already
-        # HIGH so the data interface only gates on the cal upload. Replace
-        # with real GPIO-driven set_pc6/set_pb11 when modeling the handshake.
+        model = fpga_protocol.get_model()
+        # PC6 (enable) and PB11 (gate) are boot-configured by code our
+        # function-level entry skips, so pre-seed them HIGH. CS = PB6 is
+        # driven for real by the gpiob stub (Run 8) — do NOT pre-assert it;
+        # the firmware asserts it per command.
         model.set_pc6(True)
         model.set_pb11(True)
     except Exception:

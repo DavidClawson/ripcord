@@ -483,12 +483,55 @@ level.** Contract #19 (`acq_engine_runtime`) → confidence 0.95. Residual
 unverified: real FPGA sample/reply *values* (hardware-bound — the oracle
 supplies placeholder bytes), and the GPIO handshake gating (Run 8).
 
-### Run 8 (next) — GPIO handshake + real reply values
+### Run 8 (2026-05-30) — real GPIOB handshake, CS execution-verified
 
-- **GPIO handshake lines** (PB6/PC6/PB11): upgrade `at32f403a.repl` from
-  storage-only GPIO to stubs that call `model.set_cs()/set_pc6()/set_pb11()`,
-  so the data interface gates on the real handshake, not the scaffold
-  shortcut — and feed real FPGA reply *values* (the hardware-bound ceiling).
+`at32f403a.repl` now carves **GPIOB @ 0x40010C00** out of the blanket APB2
+storage block into a Python stub that decodes SCR (0x10) / CLR (0x14) / ODT
+(0x0C) bit writes into `fpga_protocol` `set_cs()` / `set_pb11()` on a **shared
+model singleton** (`fpga_protocol.get_model()` — both the SPI3 and GPIOB stubs
+run in one IronPython engine and import the module once, so they act on the
+same `FpgaModel`). CS = PB6 active-LOW: a CLR-bit6 write (PB6 LOW) asserts CS,
+an SCR-bit6 write (PB6 HIGH) deasserts. `_data_interface_live()` now requires
+`cs_asserted` too. PC6/PB11 are boot-configured (not driven in the functions we
+enter) and stay pre-seeded HIGH.
+
+**Proof the stub drives the model (not just logs writes):** the sample-pattern
+oracle was made **CS-gated** — it hands back the incrementing counter only
+while `cs_asserted`. Re-running the **mode-4 burst** (`--mem 0x20036FC6=0x04`,
+`RIPCORD_FPGA_SAMPLE_PATTERN=1`), the buffer at `state+0x5B0` (0x200006A8)
+filled `02 03 04 05 … 15 …` exactly as in the Run-5 burst proof — which can
+only happen if the firmware's pre-dispatch `GPIOB CLR 0x40` (PB6 LOW) reached
+`model.set_cs(True)` through the stub. A broken stub would leave CS deasserted
+and the buffer all `0xFF`. So the **per-command CS handshake (PB6 active-LOW,
+asserted before the command's SPI3 activity) is now execution-verified as
+firmware-driven**, and mode 9 still emits `09 FF FF 0A FF FF` under the new
+platform with no regressions.
+
+Honest remainder: PC6/PB11 are still boot-state assumptions (their drives live
+in init code our function entry skips), and the CS *gate* only bites in a run
+where the cal table is uploaded (boot) — in pure function-level runs
+`cal_uploaded` is False, so the gate's data-vs-idle effect is exercised via the
+CS-gated pattern, not a live FPGA. Confirming the gate end-to-end, and the real
+FPGA reply *values*, is the hardware-bound ceiling (Run 9).
+
+### Run 9 (next) — real reply values, hardware-anchored
+
+The oracle has taken the MCU side as far as a software FPGA model can: dispatch,
+all 9 transaction sequences, buffer addresses, data flow, and the CS handshake
+are execution-verified. What remains is silicon-only — the FPGA's actual reply
+*values* and confirmation that our framing matches reality. Two milestones, in
+order:
+
+1. **Passive capture (cheap, do first, no custom firmware):** logic-analyzer on
+   SPI3 / USART2 / PB6 / PC6 / PB11 of the *stock* device during an acquisition;
+   diff the captured transactions against the oracle's predictions
+   (`09 FF FF 0A FF FF`; burst `04`/`05` → 512 paired reads; auto-range
+   `01 05`/`01 06`/`01 12`; boot bitstream `3B … 3A`; PB6 as per-command CS).
+   This falsifies or confirms the whole static+Renode model in one session and
+   should gate further Renode investment.
+2. **Active characterization (custom firmware, after #1 is green):** replay each
+   opcode, log real FPGA replies, decode opcode semantics, and replace the
+   placeholder reply values in `fpga_protocol.py` with measured ones.
 
 #### Original Run-5 plan (kept for context)
 

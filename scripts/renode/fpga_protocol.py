@@ -106,8 +106,13 @@ class FpgaModel(object):
 
     def _data_interface_live(self):
         # The FPGA only returns real sample/handshake data once it is
-        # enabled (PC6), gated (PB11), and the cal table is loaded.
-        return self.pc6_high and self.pb11_high and self.cal_uploaded
+        # enabled (PC6), gated (PB11), CS-asserted (PB6 LOW), and the cal
+        # table is loaded. As of Run 8 CS comes from the real GPIOB stub
+        # (the firmware asserts PB6 per command); PC6/PB11 are boot-
+        # configured and pre-seeded HIGH. The bulk cal upload path does not
+        # consult this gate, so it is unaffected.
+        return (self.cs_asserted and self.pc6_high and self.pb11_high
+                and self.cal_uploaded)
 
     # -- SPI3 -------------------------------------------------------------
     def spi_status(self):
@@ -152,6 +157,7 @@ class FpgaModel(object):
         self.access_log.append({
             "iface": "spi3", "dir": "write", "tx": tx,
             "rx_next": self._miso_next, "unverified": unverified, "note": note,
+            "cs": self.cs_asserted, "pc6": self.pc6_high, "pb11": self.pb11_high,
         })
 
     def spi_read_dt(self):
@@ -160,14 +166,18 @@ class FpgaModel(object):
         # After a non-bulk read the interface idles again unless streaming.
         if not self._data_interface_live():
             # Pattern mode: hand back a distinguishable incrementing byte so
-            # the oracle can trace each sample byte into the MCU buffer.
-            if self._pattern and not self._bulk_mode:
+            # the oracle can trace each sample byte into the MCU buffer — but
+            # only while CS is asserted (PB6 LOW). With the real GPIOB stub
+            # (Run 8) a counter-filled buffer proves the firmware drove CS;
+            # an all-0xFF buffer would mean the handshake never asserted.
+            if self._pattern and not self._bulk_mode and self.cs_asserted:
                 rx = self._sample_ctr & 0xFF
                 self._sample_ctr += 1
             self._miso_next = MISO_IDLE
         self.access_log.append({
             "iface": "spi3", "dir": "read", "rx": rx,
             "unverified": True, "note": "",
+            "cs": self.cs_asserted, "pc6": self.pc6_high, "pb11": self.pb11_high,
         })
         return rx & 0xFF
 
@@ -199,15 +209,32 @@ class FpgaModel(object):
         return n
 
 
+# --- Shared instance -----------------------------------------------------
+# Renode runs every Python.PythonPeripheral in one IronPython engine and
+# imports this module once, so a module-level singleton lets the GPIOB
+# handshake stub and the SPI3 data-path stub act on the SAME model (Run 8:
+# GPIO writes drive set_cs/set_pb11; the SPI3 read path gates on them).
+# Renode stubs call get_model(); standalone callers may still construct
+# FpgaModel() directly.
+_SHARED_MODEL = None
+
+
+def get_model():
+    global _SHARED_MODEL
+    if _SHARED_MODEL is None:
+        _SHARED_MODEL = FpgaModel()
+    return _SHARED_MODEL
+
+
 def _selftest():
     """Replay the documented handshake; runnable without Renode."""
     m = FpgaModel()
-    # Bring up enable + gate (GPIO stub would do this).
+    # Bring up enable + gate + CS (the GPIO stub does this from real writes).
     m.set_pc6(True)
     m.set_pb11(True)
+    m.set_cs(True)
 
     # Pre-cal: SPI data interface must be idle-HIGH.
-    m.set_cs(True)
     m.spi_write_dt(CMD_ID_QUERY)
     assert m.spi_read_dt() == MISO_IDLE, "pre-cal MISO must be idle-HIGH"
 
