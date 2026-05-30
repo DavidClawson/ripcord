@@ -339,6 +339,67 @@ naming a transport by its *existence* rather than by decoding its register
 IDs / endpoints. The corrected facts above are decode-backed; the open item
 (#5) is deliberately left unlabeled until its endpoint is decoded.
 
+### Run 4 (2026-05-30) — bitstream upload EXECUTION-VERIFIED; sample path located
+
+Two things changed since Run 3, both from the `fnirsi-scope-decode` workflow
+rounds (see `notes/scope_architecture_v120.md`, `notes/scope_decode_round2.md`):
+
+1. **Open item #5 ("bulk sample path NOT located") is resolved.** The runtime
+   acquisition engine is a 7092-byte FreeRTOS task at **`0x0803B454`** (was in
+   the undecoded gap; now seeded + decoded — 56916-char decompile, 233 SPI3
+   accesses). It is *polled SPI3*, not a DMA/ISR path. So the earlier "sample
+   path is either polled SPI3 in merged code or an FPGA-driven ISR" is settled:
+   polled SPI3, in code Ghidra never reached.
+
+2. **The bitstream upload runs to completion in emulation — byte-exact.**
+   Extending Run 3's entry to `--stop 0x0802ACB0` (past the `0x3A` close):
+
+   ```
+   scripts/renode/emulate_function.py --target stock_v120 \
+       --entry 0x0802A774 --stop 0x0802ACB0 \
+       --reg sp=0x20036F90 --reg r6=0x40003C08 --reg r4=0x40011000 \
+       --reg r5=0xE000E010 --reg ip=0xFFFFFC14 --reg lr=0xFFFFFC10 \
+       --mem 0x20002B1C=0x40 --mem 0x20002B20=0x40 --run
+   # -> spi3 write 115655 ; reads 346965 ; gpiob write 12
+   #    writes[spi3]: 00 05 00 00 12 00 00 15 00 00 3B 00 2A 65 24 06 30 01 8C 47 ...
+   ```
+
+   The 115,655 SPI3 DT writes = preamble (`05/12/15/3B`) + the 115,638-byte
+   flash blob `0x08051D19` **byte-exact** (`2A 65 24 06 30 01 8C 47 AF 9E 44 63
+   …` matches the raw flash dump) through the `0x3A` close, no stall.
+   **Contract #18 (`fpga_bitstream_upload`) promoted `decompile-derived →
+   execution-verified` (0.97).** The upload *mechanism* (transport + payload +
+   framing) is now silicon-independent fact; the payload's *identity* as a
+   Gowin bitstream stays `inferred` (0.75) — only a Gowin parser / hardware
+   confirms that.
+
+### Run 5 (next) — execution-verify the runtime sample path
+
+Target: emulate `acq_engine_task` (`0x0803B454`) against the stub and confirm
+the burst read writes samples to `state+0x5B0`/`+0x9B0`. The blocker is the
+entry: the task opens by *blocking* on `xQueueReceive` —
+`bl 0x803f1d8(*0x20002D78, &local_2, portMAX_DELAY)` at `0x0803B4BA`, loop
+`bne 0x0803B4B2` until a command byte arrives. In emulation the queue is empty,
+so a full-entry run spins. Two ways past it:
+- **Enter post-receive at `0x0803B4C2`** (right after `bne`), staging the
+  command byte at `[sp+0x36]` (`local_2`) via `--mem`, and setting the integer
+  context the prologue would have (`r7=0x40003C08` SPI3_STS, `r4=0x20002D78`,
+  `r9/sb=0x200000F8` state, `r5=sp+0x36`). The VFP calib constants (`s16..s28`,
+  loaded `0x0803B462–0x0803B48C`) won't be set — fine: garbage calibration
+  changes sample *values*, not the SPI3 read count or the buffer *address*,
+  which is what we're verifying structurally.
+- **Or add a `--stub-return ADDR=VAL` option to `emulate_function.py`** that
+  hooks the `xQueueReceive` BL and forces `r0=1` — cleaner, reusable, lets the
+  real prologue run.
+
+Then the FPGA stub (`fpga_protocol.py`) must return *sample* bytes (not `0xFF`
+idle) during the runtime read phase so the burst loop fills a real buffer. The
+state-struct mode-gating bytes the dispatch reads (`+0x352`, `+0x1c`,
+`DAT_2000044a/b`, `DAT_2000010e`) must be set to select burst mode — read from
+the decompile (`acq_engine_task`, `decompiled` table) per the poll-satisfaction
+loop. Convergence: a captured SPI3 read burst followed by a `state+0x5B0`
+write run promotes contract #19 (`acq_engine_runtime`) to execution-verified.
+
 ## Scaffold simplifications to revisit
 
 - **GPIO is storage-only.** `at32f403a.repl` maps GPIOA–E as plain
