@@ -168,6 +168,34 @@ def setup_target(binary: Path, name: str) -> Path:
     return dest
 
 
+def register_target(name: str, binary: Path, arch: str, svd: Path | None,
+                    is_raw: bool, base_addr: int | None) -> None:
+    """Add the target to config.yaml if missing; later stages look it up there."""
+    import yaml
+
+    config_path = REPO_ROOT / "config.yaml"
+    text = config_path.read_text()
+    if name in (yaml.safe_load(text).get("targets") or {}):
+        print(f"  config.yaml: {name} already registered")
+        return
+
+    lines = [
+        f"  {name}:",
+        f"    elf: {binary.relative_to(REPO_ROOT)}",
+        f'    description: "Added by scripts/ripcord.py from {binary.name}"',
+        f"    arch: {arch}",
+    ]
+    if is_raw:
+        lines += ["    raw_binary: true", f"    base_addr: 0x{base_addr:08X}"]
+    if svd:
+        lines.append(f"    svd: {svd.relative_to(REPO_ROOT)}")
+    config_path.write_text(text.rstrip("\n") + "\n\n" + "\n".join(lines) + "\n")
+
+    if name not in (yaml.safe_load(config_path.read_text()).get("targets") or {}):
+        die(f"could not register {name} in {config_path}; add it under targets: by hand")
+    print(f"  config.yaml: registered {name}")
+
+
 def check_ghidra() -> None:
     """Verify Ghidra is reachable."""
     r = subprocess.run(f"which {GHIDRA_PYGHIDRA.split()[0]}",
@@ -375,6 +403,7 @@ def main() -> None:
     # Step 2: Set up target
     step(2, total_steps, "Setting up target")
     binary_dest = setup_target(binary, target_name)
+    register_target(target_name, binary_dest, arch, svd, is_raw, base_addr)
 
     # Step 3: Run Ghidra extraction
     step(3, total_steps, "Running Ghidra analysis")
