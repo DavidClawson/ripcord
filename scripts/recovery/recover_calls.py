@@ -186,6 +186,14 @@ def read_vector_table_elf(elf_path: str, function_addrs: set[int],
         if func_addr == 0 or raw_value == 0xFFFFFFFF:
             continue
 
+        # Handlers are Thumb addresses inside the image. Past the 16 system
+        # exceptions, the first word that is not one marks the end of the
+        # table; without this, code after a short table reads as IRQ vectors.
+        if not (raw_value & 1 and load_vaddr <= func_addr < load_vaddr + load_filesz):
+            if i >= 16:
+                break
+            continue
+
         name = _VECTOR_NAMES.get(
             i, "IRQ{}".format(i - 16) if i >= 16 else "Exception{}".format(i)
         )
