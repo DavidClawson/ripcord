@@ -444,9 +444,12 @@ rule renode_trace:
     shell:
         r"""
         mkdir -p $(dirname {output.trace})
-        # Generate a parameterized .resc wrapper so we control output paths
-        WRAPPER=$(mktemp /tmp/renode_XXXXXX.resc)
-        cat > "$WRAPPER" <<RESC
+        # Generate a parameterized .resc wrapper so we control output paths.
+        # Quoted heredoc: $CWD is a Renode variable, not a shell one. A temp
+        # dir keeps the .resc suffix portable (BSD mktemp needs trailing Xs).
+        WRAPPER_DIR=$(mktemp -d "${{TMPDIR:-/tmp}}/renode.XXXXXX")
+        WRAPPER="$WRAPPER_DIR/scenario.resc"
+        cat > "$WRAPPER" <<'RESC'
 mach create
 machine LoadPlatformDescription @{input.repl}
 sysbus LoadELF @{input.elf}
@@ -459,7 +462,7 @@ emulation RunFor "{params.duration}"
 quit
 RESC
         {RENODE} --disable-xwt --console "$WRAPPER"
-        rm -f "$WRAPPER"
+        rm -rf "$WRAPPER_DIR"
         test -s {output.trace}
         """
 
